@@ -1,0 +1,470 @@
+"""
+Dynamic Subspace Routing SVD Trainer
+
+This is an extended version of svd_trainer.py that supports MultiSubspaceSVDLayer
+with dynamic token-wise routing across multiple subspaces.
+
+Key differences from original trainer:
+1. Uses MultiSubspaceSVDLayer instead of SVDTransformLayer
+2. Initializes multiple gamma values (low/mid/high) per layer
+3. Adds load balance loss to encourage balanced routing
+4. Supports multi-stage training (subspace-only, routing-only, joint)
+"""
+
+import argparse
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+import torch.distributions as dist
+from transformers import Trainer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForSequenceClassification
+from transformers import DataCollatorForLanguageModeling
+from accelerate import Accelerator
+import numpy as np
+import math
+import random
+from tqdm import tqdm
+from pathlib import Path
+import gc
+import json
+from datetime import datetime
+
+from utils.datautils import prepare_train_loaders
+from evaluate import evaluate_perplexity
+from modules.dynamic_subspace import (
+    MultiSubspaceSVDLayer,
+    compute_load_balance_loss,
+    get_model_routing_statistics,
+    reset_model_routing_statistics
+)
+
+
+def main(args):
+    # setting random seed of numpy and torch
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+
+    # setting device
+    print(f"Target Ratio: {args.target_ratio}")
+    print(f"Number of Subspaces: {args.n_subspaces}")
+    print(f"Routing Strategy: {args.routing_strategy}")
+    gpu_count = torch.cuda.device_count()
+    print(f"Visible GPU count: {gpu_count}")
+    NGPUS = gpu_count
+    DEV_GPU = torch.device('cuda:0')
+    DEV_CPU= torch.device('cpu')
+
+    target_compression_ratio = args.target_ratio
+
+    accelerator = Accelerator()
+
+    SEQ_LEN = args.seq_len
+
+    NSAMPLES_per_GPU_train = math.ceil(args.n_train_samples/NGPUS)
+    NSAMPLES_per_GPU_val = math.ceil(args.n_eval_samples/NGPUS)
+
+
+    SAVE = args.SAVE
+    RECREATE = args.RECREATE
+    DO_SAMPLE = args.DO_SAMPLE
+    remapping = args.remapping
+
+    NSAMPLES_train = args.n_train_samples
+    NSAMPLES_val = args.n_eval_samples
+
+
+    BETA = args.BETA
+
+    # 训练设置, TA is TrainArgument
+    TA_num_train_epochs = args.n_train_epochs
+    TA_warmup_steps = args.warmup_steps
+    TA_gradient_accumulation_steps = args.gradient_accumulation_steps
+    save_epoch_num = args.save_epoch_num
+
+
+    lambda_reg = args.lambda_reg
+    lambda_balance = args.lambda_balance  # Load balance loss weight
+
+    # 优化器设置：
+    scheduler_lr=args.scheduler_lr
+    scheduler_step_size= math.ceil(NSAMPLES_per_GPU_train / TA_gradient_accumulation_steps)
+    scheduler_gamma=args.scheduler_gamma
+    scheduler_min_lr =args.scheduler_min_lr
+
+    # Dynamic routing specific settings
+    n_subspaces = args.n_subspaces
+    routing_strategy = args.routing_strategy
+    use_soft_routing = args.use_soft_routing
+    routing_temperature = args.routing_temperature
+    learnable_thresholds = args.learnable_thresholds
+
+   # load model
+    model_load_dtype = torch.float16
+    computeSVD_dtype = torch.float32
+
+    model_id = args.model_id
+    print("processing model: ", model_id.split('/')[-1])
+
+    model_no_svd_layer_dic = {}
+    lower_id = model_id.split('/')[-1]
+
+    if "llama" in lower_id or "Llama" in lower_id:
+        model_no_svd_layer_dic[lower_id] = ['lm_head']
+    elif "opt" in lower_id:
+        model_no_svd_layer_dic[lower_id] = ['project_out', 'project_in']
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=model_load_dtype)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Set Path
+    DATASET_NAME = args.training_dataset
+    path_head_folder = Path(args.path_head_folder)
+    path_head_folder_output = Path(args.path_head_folder_output)
+    model_folder = path_head_folder / 'models' / lower_id
+    data_cache_dir = path_head_folder / 'data_cache' / DATASET_NAME
+    data_cache_dir.mkdir(parents=True, exist_ok=True)
+    dataset_cache_dir = path_head_folder / 'datasets' / DATASET_NAME
+    dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = path_head_folder_output / 'training_output' / lower_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print("The output will be saved in: ", output_dir)
+
+
+    # prepared dataset
+    tokenized_traindata, tokenized_valdata = prepare_train_loaders(tokenizer, DATASET_NAME, data_cache_dir, dataset_cache_dir, args)
+
+
+    # evaluate ppl of original model
+    print("Start evaluating the original model's PPL.")
+    val_input_ids = torch.cat([_["input_ids"].unsqueeze(0) for _ in tokenized_valdata], 0)
+    model.to(DEV_GPU)
+    orig_PPL = evaluate_perplexity(model, val_input_ids, NSAMPLES_val)
+    model.to(DEV_CPU)
+    print(f"Original Perplexity: {orig_PPL}")
+
+
+
+    # transform model to MultiSubspaceSVDLayer
+    print(f"Transforming model to MultiSubspaceSVDLayer with {n_subspaces} subspaces...")
+    model_ori_weight_size = torch.tensor(0)
+
+    for name, module in tqdm(model.named_modules(), desc="Add Multi-Subspace SVD attribute to modules"):
+        if isinstance(module, nn.Linear) and all(x not in name for x in model_no_svd_layer_dic[lower_id]):
+            parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
+            attr_name = name.rsplit('.', 1)[-1]
+            if parent_name != '':
+                parent = dict(model.named_modules())[parent_name]
+            else:
+                parent = model
+            RANK_RATIO = int(min(module.in_features, module.out_features)/SEQ_LEN)
+
+            # Calculate base gamma
+            if remapping:
+                gamma_base = (1/RANK_RATIO)*target_compression_ratio*min(module.in_features, module.out_features)
+            else:
+                gamma_base =(1/RANK_RATIO)*target_compression_ratio*module.in_features*module.out_features/(module.in_features+module.out_features)
+
+            # Initialize multiple gammas for different subspaces
+            # Strategy: low = 0.5 * base, mid = base, high = 1.5 * base
+            gamma_multipliers = args.gamma_multipliers if hasattr(args, 'gamma_multipliers') else [0.5, 1.0, 1.5]
+            gammas = [gamma_base * mult for mult in gamma_multipliers[:n_subspaces]]
+
+            print(f"Layer {name}: gammas = {[f'{g:.2f}' for g in gammas]}")
+
+            weight_size = torch.tensor(module.in_features * module.out_features)
+            model_ori_weight_size += weight_size
+
+            # Create MultiSubspaceSVDLayer
+            NewLayer = MultiSubspaceSVDLayer(
+                gammas=gammas,
+                n_subspaces=n_subspaces,
+                SEQ_LEN=SEQ_LEN,
+                beta=BETA,
+                input_size=module.in_features,
+                output_size=module.out_features,
+                weight_size=weight_size,
+                weight=module.weight,
+                bias=module.bias,
+                name=name,
+                device=model.device,
+                routing_strategy=routing_strategy,
+                learnable_thresholds=learnable_thresholds,
+                use_soft_routing=use_soft_routing,
+                routing_temperature=routing_temperature
+            )
+            setattr(parent, attr_name, NewLayer)
+            del module
+
+    model.register_buffer('ori_weight_size', model_ori_weight_size)
+    model.register_buffer('epoch_cnt', torch.tensor(0))
+    model.register_buffer('BEST_loss', torch.tensor(float('inf'), dtype=computeSVD_dtype, device = model.device))
+    gc.collect()
+    print("transform done")
+
+
+    # frozen other paramters
+    now = datetime.now()
+    formatted_time = now.strftime("%m%d-%H:%M:%S")
+    experiment_name = f"DynamicSubspace-{n_subspaces}subspace-{routing_strategy}-{target_compression_ratio}_{DATASET_NAME}_{SEQ_LEN}_{formatted_time}"
+    if remapping:
+        experiment_name = "Remapping-" + experiment_name
+    else:
+        experiment_name = "Noremapping-" + experiment_name
+
+    TA_tarined_model_output_dir = output_dir / experiment_name
+    TA_tarined_model_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save experiment config
+    config_dict = {
+        'model_id': model_id,
+        'target_compression_ratio': target_compression_ratio,
+        'n_subspaces': n_subspaces,
+        'routing_strategy': routing_strategy,
+        'learnable_thresholds': learnable_thresholds,
+        'use_soft_routing': use_soft_routing,
+        'routing_temperature': routing_temperature,
+        'lambda_reg': lambda_reg,
+        'lambda_balance': lambda_balance,
+        'gamma_multipliers': gamma_multipliers[:n_subspaces],
+        'original_ppl': orig_PPL
+    }
+    with open(TA_tarined_model_output_dir / 'config.json', 'w') as f:
+        json.dump(config_dict, f, indent=4)
+
+    # Set trainable parameters
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+
+    for module in model.modules():
+        if isinstance(module, MultiSubspaceSVDLayer):
+            # Make all gammas trainable
+            for gamma in module.gammas:
+                gamma.requires_grad = True
+
+            # Make routing parameters trainable if using learned routing
+            if routing_strategy == 'learned':
+                for param in module.router.importance_net.parameters():
+                    param.requires_grad = True
+
+            # Make thresholds trainable if enabled
+            if learnable_thresholds:
+                module.router.thresholds.requires_grad = True
+
+
+
+
+   # SVDTrainer for MultiSubspaceSVDLayer
+    def calculate_compression_loss(model, target_compression_ratio, lambda_reg):
+        size_new = torch.tensor(0., device=model.device)
+
+        for name, module in model.named_modules():
+            if isinstance(module, MultiSubspaceSVDLayer):
+                RANK_RATIO = min(module.ori.in_features, module.ori.out_features) / SEQ_LEN
+
+                # For multi-subspace, we use the average gamma weighted by routing distribution
+                routing_dist = module.router.get_routing_distribution()
+                avg_gamma = sum(gamma * routing_dist[i].item() for i, gamma in enumerate(module.gammas))
+
+                if remapping:
+                    size_now = max(module.ori.in_features, module.ori.out_features) * avg_gamma * RANK_RATIO
+                else:
+                    size_now = module.ori.in_features * avg_gamma * RANK_RATIO + module.ori.out_features * avg_gamma * RANK_RATIO
+
+                size_ori = module.ori_weight_size
+                size_new = torch.where(size_now < size_ori, size_now, size_ori) + size_new
+
+        compression_ratio = size_new / model.module.ori_weight_size
+
+        compression_loss = abs(compression_ratio - torch.tensor(target_compression_ratio, device=compression_ratio.device))
+        return lambda_reg * compression_loss, compression_ratio
+
+    def Wrong_value_loss(model):
+        penalty = torch.tensor(0., device=model.module.device)
+
+        for name, module in model.named_modules():
+            if isinstance(module, MultiSubspaceSVDLayer):
+                for gamma in module.gammas:
+                    lower_penalty = torch.relu(-gamma) ** 2
+                    upper_penalty = torch.relu(gamma - torch.tensor(SEQ_LEN, device=gamma.device)) ** 2
+                    penalty += lower_penalty + upper_penalty
+
+        return penalty
+
+    class DynamicSVDTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            outputs = model(**inputs)
+
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            neg_log_likelihood = loss
+            ppl = torch.exp(neg_log_likelihood)
+            loss = ppl
+
+            # Compression regularization
+            reg_loss, compression_ratio = calculate_compression_loss(model, target_compression_ratio, lambda_reg)
+
+            # Value penalty
+            value_loss = Wrong_value_loss(model)
+
+            # Load balance loss (encourage balanced routing)
+            balance_loss = compute_load_balance_loss(model) * lambda_balance
+
+            total_loss = loss + reg_loss + value_loss + balance_loss
+
+            cur_lr = self.optimizer.param_groups[0]['lr']
+
+            model.module.epoch_cnt += 1
+            if model.module.epoch_cnt % save_epoch_num == 0:
+                k_dict = {}
+
+                # Save all gammas for each layer
+                for name, module in self.model.named_modules():
+                    if isinstance(module, MultiSubspaceSVDLayer):
+                        k_dict[name] = {
+                            'gammas': [g.detach().item() for g in module.gammas],
+                            'routing_distribution': module.router.get_routing_distribution().cpu().tolist()
+                        }
+
+                k_dict['ppl'] = ppl.detach().tolist()
+                k_dict['compression_ratio'] = compression_ratio.detach().tolist()
+                k_dict['balance_loss'] = balance_loss.detach().tolist()
+                k_dict['lr'] = cur_lr
+
+                output_json_path = str(TA_tarined_model_output_dir/'k_dict_{:05d}.json'.format(model.module.epoch_cnt))
+                with open(output_json_path, 'w') as json_file:
+                    json.dump(k_dict, json_file, indent=4)
+
+                # Save best model
+                BEST_loss = model.module.BEST_loss
+                CURR_loss = total_loss.mean().item()
+                if CURR_loss < BEST_loss:
+                    model.module.BEST_loss = torch.tensor(CURR_loss, device = model.module.BEST_loss.device)
+                    k_dict["PPL_ORIG"] = orig_PPL
+
+                    # Also save routing statistics
+                    routing_stats = get_model_routing_statistics(model)
+                    k_dict["routing_stats"] = {k: {
+                        'routing_distribution': v['routing_distribution'].tolist() if isinstance(v['routing_distribution'], np.ndarray) else v['routing_distribution'],
+                        'gammas': v['gammas']
+                    } for k, v in routing_stats.items()}
+
+                    output_json_path = str(TA_tarined_model_output_dir/'best_gamma.json')
+                    with open(output_json_path, 'w') as json_file:
+                        json.dump(k_dict, json_file, indent=4)
+
+            return (total_loss, outputs) if return_outputs else total_loss
+
+        def create_scheduler(self, num_training_steps, optimizer):
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=scheduler_step_size, eta_min=scheduler_min_lr)
+            self.lr_scheduler=scheduler
+            return self.lr_scheduler
+
+        def create_optimizer(self):
+            optimizer = torch.optim.Adam(self.model.parameters(), lr = scheduler_lr)
+            cur_lr = optimizer.param_groups[0]['lr']
+            self.optimizer=optimizer
+            return self.optimizer
+
+
+
+
+
+   # training
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    from transformers import TrainingArguments
+    training_args = TrainingArguments(
+        output_dir= TA_tarined_model_output_dir,
+        num_train_epochs = TA_num_train_epochs,
+        evaluation_strategy = "epoch",
+        per_device_train_batch_size = 1,
+        per_device_eval_batch_size = 1,
+        warmup_steps = TA_warmup_steps,
+        lr_scheduler_type = "cosine",
+        seed = args.seed,
+        gradient_accumulation_steps = TA_gradient_accumulation_steps,
+        save_strategy = "no",
+        save_steps = 1000,
+        save_total_limit = 2,
+        remove_unused_columns=False,
+    )
+
+    trainer = DynamicSVDTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_traindata,
+        eval_dataset=tokenized_valdata,
+        data_collator=data_collator,
+    )
+
+
+    model,  train_dataloader, eval_dataloader = accelerator.prepare(
+        model, trainer.get_train_dataloader(), trainer.get_eval_dataloader()
+    )
+    trainer.train = accelerator.prepare(trainer.train)
+
+
+    # train
+    print("Starting training...")
+    trainer.train()
+    print("Training completed!")
+
+    # Save final gammas and routing statistics
+    final_dict = {}
+    for name, module in model.named_modules():
+        if isinstance(module, MultiSubspaceSVDLayer):
+            final_dict[name] = {
+                'gammas': [g.detach().item() for g in module.gammas],
+                'routing_distribution': module.router.get_routing_distribution().cpu().tolist()
+            }
+
+    with open(TA_tarined_model_output_dir / 'final_gamma.json', 'w') as f:
+        json.dump(final_dict, f, indent=4)
+
+    print(f"Training outputs saved to: {TA_tarined_model_output_dir}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    # Original arguments
+    parser.add_argument('--model_id', type=str, default='facebook/opt-125m')
+    parser.add_argument('--target_ratio', type=float, default=0.5)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--seq_len', type=int, default=2048)
+    parser.add_argument('--n_train_samples', type=int, default=128)
+    parser.add_argument('--n_eval_samples', type=int, default=64)
+    parser.add_argument('--BETA', type=float, default=100.0)
+    parser.add_argument('--n_train_epochs', type=int, default=5)
+    parser.add_argument('--warmup_steps', type=int, default=10)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=4)
+    parser.add_argument('--save_epoch_num', type=int, default=50)
+    parser.add_argument('--lambda_reg', type=float, default=10.0)
+    parser.add_argument('--scheduler_lr', type=float, default=1e-3)
+    parser.add_argument('--scheduler_gamma', type=float, default=0.9)
+    parser.add_argument('--scheduler_min_lr', type=float, default=1e-5)
+    parser.add_argument('--SAVE', action='store_true')
+    parser.add_argument('--RECREATE', action='store_true')
+    parser.add_argument('--DO_SAMPLE', action='store_true')
+    parser.add_argument('--remapping', action='store_true')
+    parser.add_argument('--training_dataset', type=str, default='wikitext')
+    parser.add_argument('--path_head_folder', type=str, default='./results')
+    parser.add_argument('--path_head_folder_output', type=str, default='./results')
+
+    # Dynamic subspace specific arguments
+    parser.add_argument('--n_subspaces', type=int, default=3, help='Number of subspaces')
+    parser.add_argument('--routing_strategy', type=str, default='norm', choices=['norm', 'learned', 'attention'])
+    parser.add_argument('--learnable_thresholds', action='store_true', help='Make routing thresholds learnable')
+    parser.add_argument('--use_soft_routing', action='store_true', help='Use soft routing instead of hard')
+    parser.add_argument('--routing_temperature', type=float, default=1.0)
+    parser.add_argument('--lambda_balance', type=float, default=0.01, help='Load balance loss weight')
+    parser.add_argument('--gamma_multipliers', nargs='+', type=float, default=[0.5, 1.0, 1.5])
+
+    args = parser.parse_args()
+    main(args)

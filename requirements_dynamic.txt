@@ -1,0 +1,16 @@
+# Requirements for Dynamic Subspace Routing
+
+# Core dependencies (same as Dobi-SVD)
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0
+datasets>=2.10.0
+
+# Visualization dependencies
+matplotlib>=3.5.0
+seaborn>=0.12.0
+numpy>=1.21.0
+
+# Optional: for analysis
+pandas>=1.3.0
+tqdm>=4.60.0
