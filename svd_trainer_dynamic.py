@@ -261,9 +261,17 @@ def main(args):
 
 
 
+   # Helper function to get the actual model (unwrap if wrapped by DDP/accelerate)
+    def get_actual_model(model):
+        """Get the actual model, unwrapping if necessary."""
+        if hasattr(model, 'module'):
+            return model.module
+        return model
+
    # SVDTrainer for MultiSubspaceSVDLayer
     def calculate_compression_loss(model, target_compression_ratio, lambda_reg):
-        size_new = torch.tensor(0., device=model.device)
+        actual_model = get_actual_model(model)
+        size_new = torch.tensor(0., device=actual_model.device)
 
         for name, module in model.named_modules():
             if isinstance(module, MultiSubspaceSVDLayer):
@@ -281,13 +289,14 @@ def main(args):
                 size_ori = module.ori_weight_size
                 size_new = torch.where(size_now < size_ori, size_now, size_ori) + size_new
 
-        compression_ratio = size_new / model.module.ori_weight_size
+        compression_ratio = size_new / actual_model.ori_weight_size
 
         compression_loss = abs(compression_ratio - torch.tensor(target_compression_ratio, device=compression_ratio.device))
         return lambda_reg * compression_loss, compression_ratio
 
     def Wrong_value_loss(model):
-        penalty = torch.tensor(0., device=model.module.device)
+        actual_model = get_actual_model(model)
+        penalty = torch.tensor(0., device=actual_model.device)
 
         for name, module in model.named_modules():
             if isinstance(module, MultiSubspaceSVDLayer):
@@ -300,6 +309,7 @@ def main(args):
 
     class DynamicSVDTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False):
+            actual_model = get_actual_model(model)
             outputs = model(**inputs)
 
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
@@ -320,8 +330,8 @@ def main(args):
 
             cur_lr = self.optimizer.param_groups[0]['lr']
 
-            model.module.epoch_cnt += 1
-            if model.module.epoch_cnt % save_epoch_num == 0:
+            actual_model.epoch_cnt += 1
+            if actual_model.epoch_cnt % save_epoch_num == 0:
                 k_dict = {}
 
                 # Save all gammas for each layer
@@ -337,15 +347,15 @@ def main(args):
                 k_dict['balance_loss'] = balance_loss.detach().tolist()
                 k_dict['lr'] = cur_lr
 
-                output_json_path = str(TA_tarined_model_output_dir/'k_dict_{:05d}.json'.format(model.module.epoch_cnt))
+                output_json_path = str(TA_tarined_model_output_dir/'k_dict_{:05d}.json'.format(actual_model.epoch_cnt))
                 with open(output_json_path, 'w') as json_file:
                     json.dump(k_dict, json_file, indent=4)
 
                 # Save best model
-                BEST_loss = model.module.BEST_loss
+                BEST_loss = actual_model.BEST_loss
                 CURR_loss = total_loss.mean().item()
                 if CURR_loss < BEST_loss:
-                    model.module.BEST_loss = torch.tensor(CURR_loss, device = model.module.BEST_loss.device)
+                    actual_model.BEST_loss = torch.tensor(CURR_loss, device = actual_model.BEST_loss.device)
                     k_dict["PPL_ORIG"] = orig_PPL
 
                     # Also save routing statistics
