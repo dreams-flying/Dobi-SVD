@@ -495,6 +495,31 @@ class UnifiedRouter(nn.Module):
         elif self.strategy == 'adaptive':
             return self.router.route(importance)
 
+    def route_hard(self, importance, x=None):
+        """
+        Hard routing: discrete assignment to subspaces.
+
+        Args:
+            importance: [batch, seq_len] - importance scores
+            x: [batch, seq_len, hidden_size] - needed for gating strategy
+        Returns:
+            routing: [batch, seq_len] - subspace assignments (long tensor)
+        """
+        return self.forward(importance, x=x, hard=True)
+
+    def route_soft(self, importance, x=None, temperature=1.0):
+        """
+        Soft routing: weighted combination of subspaces.
+
+        Args:
+            importance: [batch, seq_len] - importance scores
+            x: [batch, seq_len, hidden_size] - needed for gating strategy
+            temperature: temperature for softmax (not used by all strategies)
+        Returns:
+            routing: [batch, seq_len, n_subspaces] - routing weights
+        """
+        return self.forward(importance, x=x, hard=False)
+
 
 # ============================================================================
 # Comparison and Benchmarking
