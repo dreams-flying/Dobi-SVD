@@ -61,29 +61,89 @@ class TokenRouter(nn.Module):
         self.register_buffer('routing_counts', torch.zeros(n_subspaces))
         self.register_buffer('total_tokens', torch.tensor(0.0))
 
-    def compute_importance(self, x):
+    def compute_importance(self, x, attention_scores=None, value_vectors=None):
         """
-        Compute token importance scores.
+        Compute token importance scores using various strategies.
+
+        Based on EMNLP 2024 research: "Attention Score is not All You Need"
+        https://aclanthology.org/2024.emnlp-main.1178.pdf
+
+        Supported strategies:
+        - 'norm': L2 norm (fast, baseline)
+        - 'l1_norm': L1 norm
+        - 'value_aware': VATP method (SOTA, attention × value_norm)
+        - 'learned': Learnable predictor
+        - 'attention': Attention-only (legacy, not recommended)
+        - 'hybrid': Multi-signal combination
 
         Args:
             x: Tensor of shape [batch, seq_len, hidden_size] or [seq_len, hidden_size]
+            attention_scores: Optional [batch, num_heads, seq_len, seq_len]
+            value_vectors: Optional [batch, seq_len, hidden_size]
 
         Returns:
             importance: Tensor of shape [batch, seq_len] or [seq_len]
         """
         if self.routing_strategy == 'norm':
             # L2 norm of activation (fast, no extra parameters)
-            importance = x.norm(dim=-1) / (self.hidden_size ** 0.5)
+            # Baseline method, widely used
+            importance = x.norm(dim=-1, p=2) / (self.hidden_size ** 0.5)
+
+        elif self.routing_strategy == 'l1_norm':
+            # L1 norm (used in VATP analysis)
+            importance = x.norm(dim=-1, p=1) / self.hidden_size
+
+        elif self.routing_strategy == 'value_aware':
+            # VATP (Value-Aware Token Pruning) - EMNLP 2024 SOTA
+            # Key insight: importance = attention_score × ||value_vector||
+            # Outperforms attention-only in 12-14/16 tasks
+            if attention_scores is not None:
+                # Average attention across heads and queries
+                avg_attention = attention_scores.mean(dim=1).mean(dim=-2)
+
+                # Compute value norms (use x as value if not provided)
+                values = value_vectors if value_vectors is not None else x
+                value_norms = values.norm(dim=-1, p=2) / (self.hidden_size ** 0.5)
+
+                # VATP formula
+                importance = avg_attention * value_norms
+            else:
+                # Fallback to L2 norm if attention not available
+                importance = x.norm(dim=-1, p=2) / (self.hidden_size ** 0.5)
 
         elif self.routing_strategy == 'learned':
-            # Learnable importance predictor
+            # Learnable importance predictor (TokenButler-style)
+            # Achieves 70-75% accuracy with only 1-1.2% extra params
             importance = self.importance_net(x).squeeze(-1)
             importance = torch.sigmoid(importance)  # Normalize to [0, 1]
 
         elif self.routing_strategy == 'attention':
-            # Placeholder: requires attention scores from model
-            # In practice, this would be set externally via hooks
-            raise NotImplementedError("Attention-based routing requires external attention scores")
+            # Attention-only method (NOT RECOMMENDED based on EMNLP'24)
+            # Attention sinks have high scores but low contribution
+            if attention_scores is not None:
+                importance = attention_scores.mean(dim=1).mean(dim=-2)
+            else:
+                raise ValueError("attention_scores required for 'attention' strategy")
+
+        elif self.routing_strategy == 'hybrid':
+            # Multi-signal combination
+            # Combines norm, attention (if available), and variance
+            norm_score = x.norm(dim=-1, p=2) / (self.hidden_size ** 0.5)
+
+            if attention_scores is not None:
+                attn_score = attention_scores.mean(dim=1).mean(dim=-2)
+            else:
+                attn_score = torch.ones_like(norm_score)
+
+            var_score = x.var(dim=-1)
+
+            # Normalize each component
+            norm_score = (norm_score - norm_score.min()) / (norm_score.max() - norm_score.min() + 1e-10)
+            attn_score = (attn_score - attn_score.min()) / (attn_score.max() - attn_score.min() + 1e-10)
+            var_score = (var_score - var_score.min()) / (var_score.max() - var_score.min() + 1e-10)
+
+            # Weighted combination (equal weights)
+            importance = 0.4 * norm_score + 0.3 * attn_score + 0.3 * var_score
 
         else:
             raise ValueError(f"Unknown routing strategy: {self.routing_strategy}")

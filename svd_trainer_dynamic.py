@@ -469,7 +469,9 @@ if __name__ == "__main__":
 
     # Dynamic subspace specific arguments
     parser.add_argument('--n_subspaces', type=int, default=3, help='Number of subspaces')
-    parser.add_argument('--routing_strategy', type=str, default='norm', choices=['norm', 'learned', 'attention'])
+    parser.add_argument('--routing_strategy', type=str, default='norm',
+                       choices=['norm', 'l1_norm', 'value_aware', 'learned', 'attention', 'hybrid'],
+                       help='Token importance routing strategy (value_aware=SOTA from EMNLP24)')
     parser.add_argument('--learnable_thresholds', action='store_true', help='Make routing thresholds learnable')
     parser.add_argument('--use_soft_routing', action='store_true', help='Use soft routing instead of hard')
     parser.add_argument('--routing_temperature', type=float, default=1.0)
