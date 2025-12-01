@@ -122,6 +122,7 @@ class EnhancedTokenImportanceCalculator(nn.Module):
             value_vectors = x  # Fallback to using x as value
 
         if attention_scores is not None:
+            # Method 1: Use real attention scores (best)
             # Average attention scores across heads and queries
             # Shape: [batch, num_heads, seq_len, seq_len] -> [batch, seq_len]
             avg_attention = attention_scores.mean(dim=1).mean(dim=-2)
@@ -133,8 +134,26 @@ class EnhancedTokenImportanceCalculator(nn.Module):
             # VATP formula: importance = attention × value_norm
             importance = avg_attention * value_norms
         else:
-            # Fallback to L2 norm if attention not available
-            importance = self.compute_l2_norm(x)
+            # Method 2: Approximate VATP without actual attention
+            # Use self-similarity as attention proxy + value norms
+
+            # Compute self-similarity (cosine similarity between tokens)
+            x_norm = F.normalize(x, p=2, dim=-1)  # [batch, seq, hidden]
+
+            # Pairwise similarity approximates attention pattern
+            similarity = torch.matmul(x_norm, x_norm.transpose(-2, -1))  # [batch, seq, seq]
+
+            # Average similarity (like avg attention received)
+            avg_similarity = similarity.mean(dim=-1)  # [batch, seq]
+
+            # Compute value norms
+            value_norms = x.norm(dim=-1, p=2) / math.sqrt(self.hidden_size)
+
+            # Approximate VATP: similarity × value_norm
+            importance = avg_similarity * value_norms
+
+            # Re-normalize for stability
+            importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
 
         return importance
 

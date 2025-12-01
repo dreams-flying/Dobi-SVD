@@ -98,6 +98,7 @@ class TokenRouter(nn.Module):
             # Key insight: importance = attention_score × ||value_vector||
             # Outperforms attention-only in 12-14/16 tasks
             if attention_scores is not None:
+                # Method 1: Use real attention scores (best, if available)
                 # Average attention across heads and queries
                 avg_attention = attention_scores.mean(dim=1).mean(dim=-2)
 
@@ -108,8 +109,33 @@ class TokenRouter(nn.Module):
                 # VATP formula
                 importance = avg_attention * value_norms
             else:
-                # Fallback to L2 norm if attention not available
-                importance = x.norm(dim=-1, p=2) / (self.hidden_size ** 0.5)
+                # Method 2: Approximate VATP without actual attention
+                # Use self-similarity as attention proxy + value norms
+                # This preserves VATP's key insight while being practical
+
+                # Compute self-similarity (cosine similarity between tokens)
+                # Normalize activations
+                x_norm = F.normalize(x, p=2, dim=-1)  # [batch, seq, hidden]
+
+                # Compute pairwise similarity (approximates attention pattern)
+                # similarity[i,j] = how similar token i is to token j
+                similarity = torch.matmul(x_norm, x_norm.transpose(-2, -1))  # [batch, seq, seq]
+
+                # Average similarity to all other tokens (like avg attention received)
+                avg_similarity = similarity.mean(dim=-1)  # [batch, seq]
+
+                # Compute value norms (activation magnitude)
+                value_norms = x.norm(dim=-1, p=2) / (self.hidden_size ** 0.5)
+
+                # Approximate VATP: similarity × value_norm
+                # Intuition:
+                # - High similarity → token is contextually relevant
+                # - High value norm → token has strong signal
+                # - Product → tokens that are both relevant and strong
+                importance = avg_similarity * value_norms
+
+                # Re-normalize to [0, 1] for stability
+                importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
 
         elif self.routing_strategy == 'learned':
             # Learnable importance predictor (TokenButler-style)
