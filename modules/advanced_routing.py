@@ -436,10 +436,14 @@ class UnifiedRouter(nn.Module):
         routing = router(importance, x)  # x only needed for gating
     """
 
-    def __init__(self, strategy='topk', n_subspaces=3, hidden_size=None, **kwargs):
+    def __init__(self, strategy='topk', n_subspaces=3, hidden_size=None, device=None, **kwargs):
         super().__init__()
         self.strategy = strategy
         self.n_subspaces = n_subspaces
+        self.device = device
+
+        # Filter out device from kwargs for routers that don't need it
+        # (Most routers don't explicitly accept device parameter)
 
         if strategy == 'topk':
             self.router = TopKRouter(n_subspaces, **kwargs)
@@ -454,6 +458,10 @@ class UnifiedRouter(nn.Module):
             self.router = AdaptiveThresholdRouter(n_subspaces, **kwargs)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
+
+        # Move router to device if specified
+        if device is not None:
+            self.router = self.router.to(device)
 
     def forward(self, importance, x=None, hard=True):
         """
