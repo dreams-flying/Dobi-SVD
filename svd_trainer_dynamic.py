@@ -115,6 +115,20 @@ def main(args):
     routing_temperature = args.routing_temperature
     learnable_thresholds = args.learnable_thresholds
 
+    # Advanced routing settings
+    advanced_routing = args.advanced_routing
+    advanced_routing_kwargs = {}
+    if advanced_routing is not None:
+        print(f"Using advanced routing strategy: {advanced_routing}")
+        if advanced_routing in ['topk', 'expert_choice']:
+            advanced_routing_kwargs['top_k'] = args.advanced_routing_topk
+            advanced_routing_kwargs['capacity_factor'] = args.advanced_routing_capacity
+        elif advanced_routing == 'sinkhorn':
+            advanced_routing_kwargs['sinkhorn_iters'] = args.advanced_routing_sinkhorn_iters
+        # gating and adaptive don't need extra kwargs
+    else:
+        advanced_routing_kwargs = None
+
    # load model
     model_load_dtype = torch.float16
     computeSVD_dtype = torch.float32
@@ -210,7 +224,9 @@ def main(args):
                 routing_strategy=routing_strategy,
                 learnable_thresholds=learnable_thresholds,
                 use_soft_routing=use_soft_routing,
-                routing_temperature=routing_temperature
+                routing_temperature=routing_temperature,
+                advanced_routing=advanced_routing,
+                advanced_routing_kwargs=advanced_routing_kwargs
             )
             setattr(parent, attr_name, NewLayer)
             del module
@@ -246,6 +262,8 @@ def main(args):
         'lambda_reg': lambda_reg,
         'lambda_balance': lambda_balance,
         'gamma_multipliers': gamma_multipliers[:n_subspaces],
+        'advanced_routing': advanced_routing,
+        'advanced_routing_kwargs': advanced_routing_kwargs,
         'original_ppl': orig_PPL
     }
     with open(TA_tarined_model_output_dir / 'config.json', 'w') as f:
@@ -269,6 +287,13 @@ def main(args):
             # Make thresholds trainable if enabled
             if learnable_thresholds:
                 module.router.thresholds.requires_grad = True
+
+            # Make advanced routing parameters trainable if using gating
+            if advanced_routing == 'gating' and hasattr(module.router, 'advanced_router'):
+                if hasattr(module.router.advanced_router, 'gating_network'):
+                    for param in module.router.advanced_router.gating_network.parameters():
+                        param.requires_grad = True
+                        print(f"Making gating network parameters trainable for {module.name}")
 
 
 
@@ -489,6 +514,18 @@ if __name__ == "__main__":
     parser.add_argument('--routing_temperature', type=float, default=1.0)
     parser.add_argument('--lambda_balance', type=float, default=0.01, help='Load balance loss weight')
     parser.add_argument('--gamma_multipliers', nargs='+', type=float, default=[0.5, 1.0, 1.5])
+
+    # Advanced routing strategies (optional, provides better load balancing)
+    parser.add_argument('--advanced_routing', type=str, default=None,
+                       choices=['topk', 'expert_choice', 'sinkhorn', 'gating', 'adaptive'],
+                       help='Advanced routing method: topk (Switch Transformer), expert_choice (Google 2022), '
+                            'sinkhorn (Optimal Transport), gating (learnable MLP), adaptive (dynamic quantiles)')
+    parser.add_argument('--advanced_routing_topk', type=int, default=1,
+                       help='Top-k value for topk routing (default: 1)')
+    parser.add_argument('--advanced_routing_capacity', type=float, default=1.25,
+                       help='Capacity factor for expert_choice/topk routing (default: 1.25)')
+    parser.add_argument('--advanced_routing_sinkhorn_iters', type=int, default=3,
+                       help='Number of Sinkhorn iterations (default: 3)')
 
     args = parser.parse_args()
     main(args)

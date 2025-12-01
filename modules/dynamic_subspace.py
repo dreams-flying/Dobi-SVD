@@ -16,6 +16,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .stable_svd import stable_lowrank_SVD, computeSVD_dtype, model_load_dtype, val_epsilon
 
+# Import advanced routing strategies
+try:
+    from .advanced_routing import UnifiedRouter
+    ADVANCED_ROUTING_AVAILABLE = True
+except ImportError:
+    ADVANCED_ROUTING_AVAILABLE = False
+    print("Warning: Advanced routing not available. Install advanced_routing.py to use.")
+
 
 class TokenRouter(nn.Module):
     """
@@ -25,6 +33,13 @@ class TokenRouter(nn.Module):
     - 'norm': Fast activation norm-based routing (default)
     - 'learned': Learnable importance predictor
     - 'attention': Attention score-based (requires attention hooks)
+
+    Advanced routing methods (requires advanced_routing=True):
+    - 'topk': Top-K routing (Switch Transformer)
+    - 'expert_choice': Expert Choice routing (Google 2022)
+    - 'sinkhorn': Sinkhorn routing (Optimal Transport)
+    - 'gating': Gating Network routing (learnable MLP)
+    - 'adaptive': Adaptive threshold routing (dynamic quantiles)
     """
 
     def __init__(self,
@@ -32,6 +47,8 @@ class TokenRouter(nn.Module):
                  n_subspaces=3,
                  routing_strategy='norm',
                  learnable_thresholds=False,
+                 advanced_routing=None,
+                 advanced_routing_kwargs=None,
                  device=None):
         super(TokenRouter, self).__init__()
 
@@ -39,8 +56,30 @@ class TokenRouter(nn.Module):
         self.n_subspaces = n_subspaces
         self.routing_strategy = routing_strategy
         self.device = device
+        self.advanced_routing = advanced_routing
 
-        # Initialize thresholds for routing
+        # Initialize advanced router if specified
+        if advanced_routing is not None:
+            if not ADVANCED_ROUTING_AVAILABLE:
+                raise ImportError("Advanced routing requested but advanced_routing.py not found")
+
+            # Default kwargs
+            if advanced_routing_kwargs is None:
+                advanced_routing_kwargs = {}
+
+            # Create unified router
+            self.advanced_router = UnifiedRouter(
+                strategy=advanced_routing,
+                n_subspaces=n_subspaces,
+                hidden_size=hidden_size,
+                device=device,
+                **advanced_routing_kwargs
+            )
+            print(f"Using advanced routing: {advanced_routing}")
+        else:
+            self.advanced_router = None
+
+        # Initialize thresholds for routing (used for threshold-based routing only)
         # Default: [0.33, 0.67] for 3 subspaces -> low:[0,0.33), mid:[0.33,0.67), high:[0.67,1.0]
         initial_thresholds = torch.linspace(0, 1, n_subspaces + 1)[1:-1]
 
@@ -197,6 +236,22 @@ class TokenRouter(nn.Module):
         Returns:
             routing: Routing assignments [batch, seq_len] (hard) or [batch, seq_len, n_subspaces] (soft)
         """
+        # Use advanced router if specified
+        if self.advanced_router is not None:
+            if hard:
+                routing = self.advanced_router.route_hard(importance)
+            else:
+                routing = self.advanced_router.route_soft(importance, temperature=temperature)
+
+            # Update statistics
+            if self.training and hard:
+                for i in range(self.n_subspaces):
+                    self.routing_counts[i] += (routing == i).sum().float()
+                self.total_tokens += routing.numel()
+
+            return routing
+
+        # Default threshold-based routing
         # Normalize importance to [0, 1]
         importance_min = importance.min()
         importance_max = importance.max()
@@ -282,7 +337,9 @@ class MultiSubspaceSVDLayer(nn.Module):
                  learnable_thresholds=False,
                  use_soft_routing=False,
                  routing_temperature=1.0,
-                 load_balance_weight=0.01):
+                 load_balance_weight=0.01,
+                 advanced_routing=None,
+                 advanced_routing_kwargs=None):
         super(MultiSubspaceSVDLayer, self).__init__()
 
         assert gammas is not None and len(gammas) == n_subspaces, \
@@ -323,6 +380,8 @@ class MultiSubspaceSVDLayer(nn.Module):
             n_subspaces=n_subspaces,
             routing_strategy=routing_strategy,
             learnable_thresholds=learnable_thresholds,
+            advanced_routing=advanced_routing,
+            advanced_routing_kwargs=advanced_routing_kwargs,
             device=device
         )
 
