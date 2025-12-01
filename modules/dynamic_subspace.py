@@ -55,7 +55,16 @@ class TokenRouter(nn.Module):
                 nn.Linear(hidden_size, hidden_size // 4),
                 nn.ReLU(),
                 nn.Linear(hidden_size // 4, 1)
-            ).to(device)
+            )
+            # Initialize weights with small values for stability
+            for module in self.importance_net.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
+
+            if device is not None:
+                self.importance_net = self.importance_net.to(device)
 
         # Statistics tracking
         self.register_buffer('routing_counts', torch.zeros(n_subspaces))
@@ -366,8 +375,21 @@ class MultiSubspaceSVDLayer(nn.Module):
                 gamma_range = int(gamma_range.int() + 5)
                 gamma_range = min(full_rank, max(1, gamma_range))
 
-                # Compute SVD
-                U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+                # Check for numerical issues before SVD
+                if torch.isnan(x).any() or torch.isinf(x).any():
+                    # Fallback: replace problematic values
+                    x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+                    x = torch.where(torch.isinf(x), torch.zeros_like(x), x)
+
+                # Compute SVD with error handling
+                try:
+                    U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+                except RuntimeError as e:
+                    # If SVD fails, use fallback: just pass through
+                    print(f"Warning: SVD failed for subspace {subspace_id}, using identity: {e}")
+                    weight = routing_weights[:, subspace_id].unsqueeze(-1)
+                    x_transformed += (weight * x).to(model_load_dtype)
+                    continue
                 sequence = torch.arange(1, len(S) + 1).to(x.device)
                 real_gamma = min(len(S), max(1, gamma))
 

@@ -32,6 +32,18 @@ import gc
 import json
 from datetime import datetime
 
+# Fix for CUDA cusolver errors in multi-GPU training
+# Use magma backend which is more stable for SVD operations
+try:
+    torch.backends.cuda.preferred_linalg_library('magma')
+    print("Using MAGMA backend for linear algebra operations")
+except:
+    try:
+        torch.backends.cuda.preferred_linalg_library('cusolver')
+        print("Using cuSOLVER backend (default)")
+    except:
+        print("Warning: Could not set preferred linalg library")
+
 from utils.datautils import prepare_train_loaders
 from evaluate import evaluate_perplexity
 from modules.dynamic_subspace import (
