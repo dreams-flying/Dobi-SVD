@@ -215,8 +215,6 @@ class ExpertChoiceRouter(nn.Module):
 
         # Create affinity scores for each (token, subspace) pair
         # Higher importance tokens are more attractive to higher subspaces
-        token_indices = torch.arange(seq_len, device=importance.device).float()
-
         affinity = torch.zeros(batch_size, seq_len, self.n_subspaces, device=importance.device)
 
         for i in range(self.n_subspaces):
@@ -225,30 +223,53 @@ class ExpertChoiceRouter(nn.Module):
             distance = torch.abs(normalized - target_importance)
             affinity[..., i] = 1.0 - distance
 
-        # Each expert (subspace) selects top-k tokens
+        # ============================================================================
+        # OPTIMIZED: Vectorized assignment (no Python loops!)
+        # ============================================================================
+
+        # Each expert selects top-k tokens
+        # topk_indices: [batch, n_subspaces, tokens_per_expert]
+        # topk_values: [batch, n_subspaces, tokens_per_expert]
+        topk_values, topk_indices = torch.topk(
+            affinity.transpose(1, 2),  # [batch, n_subspaces, seq_len]
+            k=self.tokens_per_expert,
+            dim=-1
+        )
+
+        # Create routing and weights tensors
         routing = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=importance.device)
         weights = torch.zeros(batch_size, seq_len, device=importance.device)
 
+        # Vectorized assignment using scatter
+        # For each expert, assign its selected tokens
+        batch_idx = torch.arange(batch_size, device=importance.device).unsqueeze(1)  # [batch, 1]
+
         for i in range(self.n_subspaces):
-            # Get affinity scores for this expert
-            expert_affinity = affinity[..., i]  # [batch, seq_len]
+            # Get indices and values for this expert
+            expert_indices = topk_indices[:, i, :]  # [batch, tokens_per_expert]
+            expert_values = topk_values[:, i, :]    # [batch, tokens_per_expert]
 
-            # Select top-k tokens for this expert
-            topk_values, topk_indices = torch.topk(expert_affinity, k=self.tokens_per_expert, dim=-1)
+            # Create mask for unassigned tokens - fully vectorized
+            current_routing = routing[batch_idx, expert_indices]  # [batch, tokens_per_expert]
+            unassigned_mask = (current_routing == -1)  # [batch, tokens_per_expert]
 
-            # Assign these tokens to this expert
-            for b in range(batch_size):
-                for idx in topk_indices[b]:
-                    if routing[b, idx] == -1:  # Not yet assigned
-                        routing[b, idx] = i
-                        weights[b, idx] = topk_values[b, topk_indices[b] == idx].item()
+            # Assign only unassigned tokens - fully vectorized (no batch loop!)
+            # Expand batch indices to match expert_indices shape
+            batch_idx_expanded = batch_idx.expand(-1, self.tokens_per_expert)  # [batch, tokens_per_expert]
 
-        # Handle unassigned tokens (assign to nearest available subspace)
-        for b in range(batch_size):
-            unassigned = (routing[b] == -1).nonzero(as_tuple=True)[0]
-            if len(unassigned) > 0:
-                routing[b, unassigned] = 0  # Assign to first subspace
-                weights[b, unassigned] = 0.1  # Low weight
+            # Filter by unassigned mask
+            valid_batch_idx = batch_idx_expanded[unassigned_mask]
+            valid_token_idx = expert_indices[unassigned_mask]
+            valid_values = expert_values[unassigned_mask]
+
+            # Vectorized assignment
+            routing[valid_batch_idx, valid_token_idx] = i
+            weights[valid_batch_idx, valid_token_idx] = valid_values
+
+        # Handle unassigned tokens - vectorized
+        unassigned_mask = (routing == -1)
+        routing[unassigned_mask] = 0
+        weights[unassigned_mask] = 0.1
 
         if squeeze_output:
             routing = routing.squeeze(0)
