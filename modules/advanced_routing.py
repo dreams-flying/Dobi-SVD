@@ -531,7 +531,16 @@ class UnifiedRouter(nn.Module):
 
         elif self.strategy == 'expert_choice':
             routing, weights = self.router.route(importance)
-            return routing if hard else weights.unsqueeze(-1).expand(-1, -1, self.n_subspaces)
+            if hard:
+                return routing
+            else:
+                # Handle both 1D [seq_len] and 2D [batch, seq_len] weights
+                if weights.dim() == 1:
+                    # 1D: [seq_len] -> [seq_len, 1] -> [seq_len, n_subspaces]
+                    return weights.unsqueeze(-1).expand(-1, self.n_subspaces)
+                else:
+                    # 2D: [batch, seq_len] -> [batch, seq_len, 1] -> [batch, seq_len, n_subspaces]
+                    return weights.unsqueeze(-1).expand(-1, -1, self.n_subspaces)
 
         elif self.strategy == 'sinkhorn':
             return self.router.route(importance, hard=hard)
