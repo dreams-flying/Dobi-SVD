@@ -770,9 +770,15 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         """
         batch_size, seq_len, hidden_size = x.shape
         device = x.device
+        input_dtype = x.dtype  # Get input dtype (could be FP16 or FP32)
 
         # Flatten for processing
         x_flat = x.view(-1, hidden_size)  # [batch*seq, hidden]
+
+        # Convert shared parameters to input dtype for computation
+        V_shared = self.V_shared.to(input_dtype)
+        S_shared = self.S_shared.to(input_dtype)
+        U_shared = self.U_shared.to(input_dtype)
 
         # Linear transformation: x_transformed = x @ W^T
         # Where W ≈ U @ diag(S) @ V (SVD approximation)
@@ -780,8 +786,8 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
 
         # Compute importance scores for routing
         # Use the reconstructed activation for importance
-        x_approx = x_flat @ self.V_shared.T * self.S_shared.unsqueeze(0)
-        x_approx = x_approx @ self.U_shared.T
+        x_approx = x_flat @ V_shared.T * S_shared.unsqueeze(0)
+        x_approx = x_approx @ U_shared.T
 
         # Reshape for router
         x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
@@ -823,24 +829,24 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                     continue
 
                 # Compute truncation function for this gamma
-                sequence = torch.arange(1, len(self.S_shared) + 1,
-                                      device=device, dtype=self.S_shared.dtype)
+                sequence = torch.arange(1, len(S_shared) + 1,
+                                      device=device, dtype=input_dtype)
 
-                gamma_val = gamma.clamp(min=1.0, max=len(self.S_shared))
+                gamma_val = gamma.clamp(min=1.0, max=len(S_shared))
                 trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
 
                 # Apply truncation to shared singular values
-                S_truncated = self.S_shared * trunc  # [svd_rank]
+                S_truncated = S_shared * trunc  # [svd_rank]
 
                 # Reconstruct: x_sub = x @ V^T @ diag(S_truncated) @ U^T
                 # Step 1: x @ V^T
-                xV = x_flat @ self.V_shared.T  # [batch*seq, svd_rank]
+                xV = x_flat @ V_shared.T  # [batch*seq, svd_rank]
 
                 # Step 2: multiply by truncated S
                 xVS = xV * S_truncated.unsqueeze(0)  # [batch*seq, svd_rank]
 
                 # Step 3: @ U^T
-                x_sub = xVS @ self.U_shared.T  # [batch*seq, output_size]
+                x_sub = xVS @ U_shared.T  # [batch*seq, output_size]
 
                 # Weight and accumulate
                 weighted_sub = (weight * x_sub).to(model_load_dtype)
@@ -874,16 +880,16 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 x_sub = x_flat[mask]  # [n_tokens, hidden]
 
                 # Compute truncation
-                sequence = torch.arange(1, len(self.S_shared) + 1,
-                                      device=device, dtype=self.S_shared.dtype)
-                gamma_val = gamma.clamp(min=1.0, max=len(self.S_shared))
+                sequence = torch.arange(1, len(S_shared) + 1,
+                                      device=device, dtype=input_dtype)
+                gamma_val = gamma.clamp(min=1.0, max=len(S_shared))
                 trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
-                S_truncated = self.S_shared * trunc
+                S_truncated = S_shared * trunc
 
                 # Reconstruct
-                xV = x_sub @ self.V_shared.T
+                xV = x_sub @ V_shared.T
                 xVS = xV * S_truncated.unsqueeze(0)
-                x_sub_transformed = xVS @ self.U_shared.T
+                x_sub_transformed = xVS @ U_shared.T
 
                 # Assign back
                 output[mask] = x_sub_transformed
