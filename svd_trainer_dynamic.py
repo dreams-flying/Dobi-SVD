@@ -120,9 +120,14 @@ def main(args):
     advanced_routing_kwargs = {}
     if advanced_routing is not None:
         print(f"Using advanced routing strategy: {advanced_routing}")
-        if advanced_routing in ['topk', 'expert_choice']:
+        if advanced_routing == 'topk':
             advanced_routing_kwargs['top_k'] = args.advanced_routing_topk
             advanced_routing_kwargs['capacity_factor'] = args.advanced_routing_capacity
+        elif advanced_routing == 'expert_choice':
+            # ExpertChoiceRouter uses tokens_per_expert, not top_k
+            # If None, it will auto-calculate as seq_len / n_subspaces
+            # We don't set it here - let the router handle it automatically
+            pass
         elif advanced_routing == 'sinkhorn':
             advanced_routing_kwargs['sinkhorn_iters'] = args.advanced_routing_sinkhorn_iters
         # gating and adaptive don't need extra kwargs
