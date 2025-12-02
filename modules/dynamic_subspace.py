@@ -453,16 +453,18 @@ class MultiSubspaceSVDLayer(nn.Module):
                 except RuntimeError as e:
                     # If SVD fails, use fallback: just pass through
                     print(f"Warning: SVD failed for subspace {subspace_id}, using identity: {e}")
-                    x_transformed.add_((weight * x).to(model_load_dtype))
+                    fallback = (weight * x).to(model_load_dtype)
+                    x_transformed = x_transformed + fallback
+                    del fallback
                     continue
 
-                # MEMORY OPTIMIZATION: Use in-place operations where possible
+                # MEMORY OPTIMIZATION: Efficient operations but no in-place on gradient tensors
                 sequence = torch.arange(1, len(S) + 1, device=x.device, dtype=x.dtype)
                 real_gamma = min(len(S), max(1, gamma))
 
-                # Apply truncation (in-place)
-                Trunc = torch.tanh(self.beta * (real_gamma - sequence)).mul_(0.5).add_(0.5)
-                S_transformed = S.mul(Trunc)
+                # Apply truncation (no in-place operations!)
+                Trunc = 0.5 * torch.tanh(self.beta * (real_gamma - sequence)) + 0.5
+                S_transformed = S * Trunc
 
                 # Reconstruct using memory-efficient matrix multiplication
                 # x_sub = U @ diag(S_transformed) @ V^T
@@ -473,9 +475,10 @@ class MultiSubspaceSVDLayer(nn.Module):
                 # Free intermediate tensors immediately
                 del U, S, V, sequence, Trunc, S_transformed, US
 
-                # Weight and accumulate (in-place)
-                x_transformed.add_((weight * x_sub).to(model_load_dtype))
-                del x_sub, weight
+                # Weight and accumulate (no in-place on x_transformed - needs gradients!)
+                weighted_sub = (weight * x_sub).to(model_load_dtype)
+                x_transformed = x_transformed + weighted_sub
+                del x_sub, weight, weighted_sub
 
             real_x = x_transformed
 

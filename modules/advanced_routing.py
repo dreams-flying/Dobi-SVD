@@ -210,10 +210,10 @@ class ExpertChoiceRouter(nn.Module):
         if self.tokens_per_expert is None:
             self.tokens_per_expert = seq_len // self.n_subspaces
 
-        # Normalize importance (in-place to save memory)
+        # Normalize importance (no in-place to preserve gradients)
         imp_min = importance.min()
         imp_max = importance.max()
-        normalized = importance.sub(imp_min).div_(imp_max - imp_min + 1e-10)
+        normalized = (importance - imp_min) / (imp_max - imp_min + 1e-10)
 
         # MEMORY OPTIMIZATION: Don't create full affinity matrix
         # Instead, compute affinity for each expert on-the-fly
