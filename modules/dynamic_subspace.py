@@ -425,8 +425,8 @@ class MultiSubspaceSVDLayer(nn.Module):
                 hard=False
             )  # Shape: [m, n_subspaces]
 
-            # Compute SVD for each subspace
-            x_transformed = torch.zeros_like(x).to(model_load_dtype)
+            # MEMORY OPTIMIZATION: Initialize output tensor
+            x_transformed = torch.zeros_like(x, dtype=model_load_dtype)
 
             for subspace_id, gamma in enumerate(self.gammas):
                 # Determine SVD rank for this subspace
@@ -440,29 +440,42 @@ class MultiSubspaceSVDLayer(nn.Module):
                     x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
                     x = torch.where(torch.isinf(x), torch.zeros_like(x), x)
 
+                # Get routing weight for this subspace
+                weight = routing_weights[:, subspace_id].unsqueeze(-1)  # [m, 1]
+
+                # Skip if weight is very small (memory optimization)
+                if weight.abs().max() < 1e-6:
+                    continue
+
                 # Compute SVD with error handling
                 try:
                     U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
                 except RuntimeError as e:
                     # If SVD fails, use fallback: just pass through
                     print(f"Warning: SVD failed for subspace {subspace_id}, using identity: {e}")
-                    weight = routing_weights[:, subspace_id].unsqueeze(-1)
-                    x_transformed += (weight * x).to(model_load_dtype)
+                    x_transformed.add_((weight * x).to(model_load_dtype))
                     continue
-                sequence = torch.arange(1, len(S) + 1).to(x.device)
+
+                # MEMORY OPTIMIZATION: Use in-place operations where possible
+                sequence = torch.arange(1, len(S) + 1, device=x.device, dtype=x.dtype)
                 real_gamma = min(len(S), max(1, gamma))
 
-                # Apply truncation
-                Trunc = 0.5 * torch.tanh(self.beta * (real_gamma - sequence)) + 0.5
-                S_transformed = S * Trunc
-                S_diag = torch.diag_embed(S_transformed)
+                # Apply truncation (in-place)
+                Trunc = torch.tanh(self.beta * (real_gamma - sequence)).mul_(0.5).add_(0.5)
+                S_transformed = S.mul(Trunc)
 
-                # Reconstruct
-                x_sub = torch.matmul(torch.matmul(U, S_diag), V.T)
+                # Reconstruct using memory-efficient matrix multiplication
+                # x_sub = U @ diag(S_transformed) @ V^T
+                # Optimize: (U @ diag(S)) @ V^T saves memory
+                US = U * S_transformed.unsqueeze(0)  # [m, rank]
+                x_sub = torch.matmul(US, V.T)  # [m, n]
 
-                # Weight by routing probability
-                weight = routing_weights[:, subspace_id].unsqueeze(-1)  # [m, 1]
-                x_transformed += (weight * x_sub).to(model_load_dtype)
+                # Free intermediate tensors immediately
+                del U, S, V, sequence, Trunc, S_transformed, US
+
+                # Weight and accumulate (in-place)
+                x_transformed.add_((weight * x_sub).to(model_load_dtype))
+                del x_sub, weight
 
             real_x = x_transformed
 
