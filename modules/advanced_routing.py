@@ -45,16 +45,25 @@ class TopKRouter(nn.Module):
         Hard routing: each token goes to top-1 subspace.
 
         Args:
-            importance: [batch, seq_len]
+            importance: [batch, seq_len] or [seq_len]
         Returns:
-            routing: [batch, seq_len] (subspace IDs)
+            routing: [batch, seq_len] or [seq_len] (subspace IDs)
         """
+        # Handle 1D input
+        squeeze_output = False
+        if importance.dim() == 1:
+            importance = importance.unsqueeze(0)
+            squeeze_output = True
+
         batch_size, seq_len = importance.shape
 
         # Normalize importance to [0, n_subspaces)
         # Higher importance → higher subspace ID
         normalized = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
         routing = (normalized * self.n_subspaces).long().clamp(0, self.n_subspaces - 1)
+
+        if squeeze_output:
+            routing = routing.squeeze(0)
 
         return routing
 
@@ -63,11 +72,17 @@ class TopKRouter(nn.Module):
         Soft routing: each token uses top-k subspaces.
 
         Args:
-            importance: [batch, seq_len]
+            importance: [batch, seq_len] or [seq_len]
         Returns:
-            routing_weights: [batch, seq_len, n_subspaces]
-            routing_indices: [batch, seq_len, top_k]
+            routing_weights: [batch, seq_len, n_subspaces] or [seq_len, n_subspaces]
+            routing_indices: [batch, seq_len, top_k] or [seq_len, top_k]
         """
+        # Handle 1D input
+        squeeze_output = False
+        if importance.dim() == 1:
+            importance = importance.unsqueeze(0)
+            squeeze_output = True
+
         batch_size, seq_len = importance.shape
 
         # Create scores for each subspace
@@ -94,6 +109,10 @@ class TopKRouter(nn.Module):
         # Convert to full routing weights
         routing_weights = torch.zeros_like(scores)
         routing_weights.scatter_(-1, topk_indices, routing_weights_topk)
+
+        if squeeze_output:
+            routing_weights = routing_weights.squeeze(0)
+            topk_indices = topk_indices.squeeze(0)
 
         return routing_weights, topk_indices
 
@@ -175,11 +194,17 @@ class ExpertChoiceRouter(nn.Module):
         Expert choice routing.
 
         Args:
-            importance: [batch, seq_len]
+            importance: [batch, seq_len] or [seq_len]
         Returns:
-            routing: [batch, seq_len] (which subspace, -1 if not selected)
-            weights: [batch, seq_len] (selection confidence)
+            routing: [batch, seq_len] or [seq_len] (which subspace, -1 if not selected)
+            weights: [batch, seq_len] or [seq_len] (selection confidence)
         """
+        # Handle 1D input
+        squeeze_output = False
+        if importance.dim() == 1:
+            importance = importance.unsqueeze(0)
+            squeeze_output = True
+
         batch_size, seq_len = importance.shape
 
         if self.tokens_per_expert is None:
@@ -224,6 +249,10 @@ class ExpertChoiceRouter(nn.Module):
             if len(unassigned) > 0:
                 routing[b, unassigned] = 0  # Assign to first subspace
                 weights[b, unassigned] = 0.1  # Low weight
+
+        if squeeze_output:
+            routing = routing.squeeze(0)
+            weights = weights.squeeze(0)
 
         return routing, weights
 
@@ -276,11 +305,17 @@ class SinkhornRouter(nn.Module):
         Sinkhorn routing.
 
         Args:
-            importance: [batch, seq_len]
+            importance: [batch, seq_len] or [seq_len]
             hard: If True, convert to hard assignment
         Returns:
-            routing: [batch, seq_len] (hard) or [batch, seq_len, n_subspaces] (soft)
+            routing: [batch, seq_len] or [seq_len] (hard) or [batch, seq_len, n_subspaces] or [seq_len, n_subspaces] (soft)
         """
+        # Handle 1D input
+        squeeze_output = False
+        if importance.dim() == 1:
+            importance = importance.unsqueeze(0)
+            squeeze_output = True
+
         batch_size, seq_len = importance.shape
 
         # Normalize importance
@@ -301,8 +336,12 @@ class SinkhornRouter(nn.Module):
         if hard:
             # Convert to hard assignment
             routing = torch.argmax(soft_assignment, dim=-1)
+            if squeeze_output:
+                routing = routing.squeeze(0)
             return routing
         else:
+            if squeeze_output:
+                soft_assignment = soft_assignment.squeeze(0)
             return soft_assignment
 
 
@@ -400,10 +439,16 @@ class AdaptiveThresholdRouter(nn.Module):
         Adaptive threshold routing.
 
         Args:
-            importance: [batch, seq_len]
+            importance: [batch, seq_len] or [seq_len]
         Returns:
-            routing: [batch, seq_len]
+            routing: [batch, seq_len] or [seq_len]
         """
+        # Handle 1D input
+        squeeze_output = False
+        if importance.dim() == 1:
+            importance = importance.unsqueeze(0)
+            squeeze_output = True
+
         # Update quantiles
         self.update_quantiles(importance)
 
@@ -419,6 +464,9 @@ class AdaptiveThresholdRouter(nn.Module):
 
         # Handle edge case: importance == max
         routing[importance >= self.running_quantiles[-1]] = self.n_subspaces - 1
+
+        if squeeze_output:
+            routing = routing.squeeze(0)
 
         return routing
 
