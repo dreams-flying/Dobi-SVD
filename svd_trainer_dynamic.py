@@ -48,6 +48,7 @@ from utils.datautils import prepare_train_loaders
 from evaluate import evaluate_perplexity
 from modules.dynamic_subspace import (
     MultiSubspaceSVDLayer,
+    SharedParamMultiSubspaceSVDLayer,
     compute_load_balance_loss,
     get_model_routing_statistics,
     reset_model_routing_statistics
@@ -213,26 +214,53 @@ def main(args):
             weight_size = torch.tensor(module.in_features * module.out_features)
             model_ori_weight_size += weight_size
 
-            # Create MultiSubspaceSVDLayer
-            NewLayer = MultiSubspaceSVDLayer(
-                gammas=gammas,
-                n_subspaces=n_subspaces,
-                SEQ_LEN=SEQ_LEN,
-                beta=BETA,
-                input_size=module.in_features,
-                output_size=module.out_features,
-                weight_size=weight_size,
-                weight=module.weight,
-                bias=module.bias,
-                name=name,
-                device=model.device,
-                routing_strategy=routing_strategy,
-                learnable_thresholds=learnable_thresholds,
-                use_soft_routing=use_soft_routing,
-                routing_temperature=routing_temperature,
-                advanced_routing=advanced_routing,
-                advanced_routing_kwargs=advanced_routing_kwargs
-            )
+            # Choose layer type based on parameter sharing setting
+            use_shared = args.use_shared_params if hasattr(args, 'use_shared_params') else False
+
+            if use_shared:
+                # Use parameter-shared version (saves ~66% VRAM)
+                print(f"[SharedParam] Creating SharedParamMultiSubspaceSVDLayer for {name}")
+                NewLayer = SharedParamMultiSubspaceSVDLayer(
+                    gammas=gammas,
+                    n_subspaces=n_subspaces,
+                    SEQ_LEN=SEQ_LEN,
+                    beta=BETA,
+                    input_size=module.in_features,
+                    output_size=module.out_features,
+                    weight_size=weight_size,
+                    weight=module.weight,
+                    bias=module.bias,
+                    name=name,
+                    device=model.device,
+                    routing_strategy=routing_strategy,
+                    learnable_thresholds=learnable_thresholds,
+                    use_soft_routing=use_soft_routing,
+                    routing_temperature=routing_temperature,
+                    advanced_routing=advanced_routing,
+                    advanced_routing_kwargs=advanced_routing_kwargs,
+                    svd_rank=args.shared_svd_rank if hasattr(args, 'shared_svd_rank') else None
+                )
+            else:
+                # Use standard version (independent SVD per subspace)
+                NewLayer = MultiSubspaceSVDLayer(
+                    gammas=gammas,
+                    n_subspaces=n_subspaces,
+                    SEQ_LEN=SEQ_LEN,
+                    beta=BETA,
+                    input_size=module.in_features,
+                    output_size=module.out_features,
+                    weight_size=weight_size,
+                    weight=module.weight,
+                    bias=module.bias,
+                    name=name,
+                    device=model.device,
+                    routing_strategy=routing_strategy,
+                    learnable_thresholds=learnable_thresholds,
+                    use_soft_routing=use_soft_routing,
+                    routing_temperature=routing_temperature,
+                    advanced_routing=advanced_routing,
+                    advanced_routing_kwargs=advanced_routing_kwargs
+                )
             setattr(parent, attr_name, NewLayer)
             del module
 
@@ -531,6 +559,12 @@ if __name__ == "__main__":
                        help='Capacity factor for expert_choice/topk routing (default: 1.25)')
     parser.add_argument('--advanced_routing_sinkhorn_iters', type=int, default=3,
                        help='Number of Sinkhorn iterations (default: 3)')
+
+    # Parameter sharing for training (VRAM optimization)
+    parser.add_argument('--use_shared_params', action='store_true',
+                       help='Use SharedParamMultiSubspaceSVDLayer (shares U,V across subspaces, saves ~66% VRAM)')
+    parser.add_argument('--shared_svd_rank', type=int, default=None,
+                       help='Rank for shared SVD (default: max_gamma + 10)')
 
     args = parser.parse_args()
     main(args)
