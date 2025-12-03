@@ -812,9 +812,8 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             # Flatten routing weights
             routing_weights_flat = routing_weights.view(-1, self.n_subspaces)  # [batch*seq, n_subspaces]
 
-            # Initialize output
-            output = torch.zeros(batch_size * seq_len, self.output_size,
-                               device=device, dtype=model_load_dtype)
+            # Initialize output as None - will be created on first accumulation
+            output = None
 
             # ========================================
             # 关键: 对每个子空间应用不同的gamma截断
@@ -849,13 +848,24 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 x_sub = xVS @ U_shared.T  # [batch*seq, output_size]
 
                 # Weight and accumulate
-                weighted_sub = (weight * x_sub).to(model_load_dtype)
-                output = output + weighted_sub
+                weighted_sub = weight * x_sub
+
+                if output is None:
+                    # First subspace - initialize output
+                    output = weighted_sub
+                else:
+                    # Subsequent subspaces - accumulate
+                    output = output + weighted_sub
 
                 # Free memory
                 del xV, xVS, x_sub, weighted_sub, sequence, trunc, S_truncated
 
-            real_x = output.view(batch_size, seq_len, self.output_size)
+            # If no subspace was processed (unlikely), create zero output
+            if output is None:
+                output = torch.zeros(batch_size * seq_len, self.output_size,
+                                   device=device, dtype=input_dtype)
+
+            real_x = output.view(batch_size, seq_len, self.output_size).to(model_load_dtype)
 
         else:
             # INFERENCE: Hard routing (discrete assignment)
@@ -865,8 +875,9 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             # Cache for analysis
             self.cached_routing = routing.detach().clone()
 
-            # Initialize output
-            output = torch.zeros(batch_size * seq_len, self.output_size, device=device)
+            # Initialize output with correct dtype
+            output = torch.zeros(batch_size * seq_len, self.output_size,
+                               device=device, dtype=input_dtype)
 
             # Process each subspace
             for subspace_id, gamma in enumerate(self.gammas):
