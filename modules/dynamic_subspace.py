@@ -761,6 +761,14 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         print(f"[SharedParam] Parameter reduction: {reduction:.1f}% "
               f"({standard_params:,} → {shared_params:,})")
 
+        # DEBUG: Verify gamma parameters are properly registered
+        print(f"[SharedParam] DEBUG: Number of gammas: {len(self.gammas)}")
+        for i, gamma in enumerate(self.gammas):
+            print(f"[SharedParam] DEBUG: gamma[{i}] type={type(gamma)}, "
+                  f"is_Parameter={isinstance(gamma, nn.Parameter)}, "
+                  f"requires_grad={gamma.requires_grad}, "
+                  f"value={gamma.item():.2f}")
+
     def forward(self, x):
         """
         Forward pass with shared U,V and different gamma truncations.
@@ -862,6 +870,19 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             # Output should always be set now (we process all subspaces)
             # Convert to model dtype for subsequent layers
             real_x = output.view(batch_size, seq_len, self.output_size).to(model_load_dtype)
+
+            # DEBUG: Check gradient flow
+            if hasattr(self, '_debug_count'):
+                self._debug_count += 1
+            else:
+                self._debug_count = 0
+
+            if self._debug_count < 2:  # Only print first 2 times
+                print(f"[SharedParam] DEBUG Forward:")
+                print(f"  output has grad_fn: {output.grad_fn is not None}")
+                print(f"  real_x has grad_fn: {real_x.grad_fn is not None}")
+                print(f"  routing_weights has grad_fn: {routing_weights.grad_fn is not None}")
+                print(f"  gammas[0] requires_grad: {self.gammas[0].requires_grad}")
 
         else:
             # INFERENCE: Hard routing (discrete assignment)
