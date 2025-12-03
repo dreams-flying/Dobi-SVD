@@ -756,6 +756,11 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         self.register_buffer('cached_routing', None)
         self.register_buffer('cached_importance', None)
 
+        # OPTIMIZATION: Precompute sequence tensor to avoid recomputation in forward pass
+        # This saves significant computation especially for large svd_rank
+        sequence_tensor = torch.arange(1, svd_rank + 1, dtype=torch.float32, device=device)
+        self.register_buffer('sequence_tensor', sequence_tensor)
+
         # Print parameter savings
         standard_params = n_subspaces * svd_rank * (output_size + input_size + 1)
         shared_params = svd_rank * (output_size + input_size) + n_subspaces
@@ -840,10 +845,13 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 # Even small weights contribute to gradients for gamma parameters
 
                 # Compute truncation function for this gamma
-                sequence = torch.arange(1, len(S_shared) + 1,
-                                      device=device, dtype=input_dtype)
+                # OPTIMIZATION: Use precomputed sequence tensor and convert to input dtype
+                sequence = self.sequence_tensor.to(input_dtype)
 
-                gamma_val = gamma.clamp(min=1.0, max=len(S_shared))
+                # Clamp gamma to valid range [1, svd_rank]
+                gamma_val = gamma.clamp(min=1.0, max=float(self.svd_rank))
+
+                # Smooth truncation: sigmoid-like function centered at gamma
                 trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
 
                 # Apply truncation to shared singular values
@@ -909,10 +917,9 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 # Extract tokens for this subspace
                 x_sub = x_flat[mask]  # [n_tokens, hidden]
 
-                # Compute truncation
-                sequence = torch.arange(1, len(S_shared) + 1,
-                                      device=device, dtype=input_dtype)
-                gamma_val = gamma.clamp(min=1.0, max=len(S_shared))
+                # Compute truncation - OPTIMIZATION: use precomputed sequence
+                sequence = self.sequence_tensor.to(input_dtype)
+                gamma_val = gamma.clamp(min=1.0, max=float(self.svd_rank))
                 trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
                 S_truncated = S_shared * trunc
 
