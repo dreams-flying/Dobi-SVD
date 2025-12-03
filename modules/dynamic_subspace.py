@@ -352,9 +352,10 @@ class MultiSubspaceSVDLayer(nn.Module):
         self.load_balance_weight = load_balance_weight
 
         # Create parameter list for gammas (all trainable)
-        # CRITICAL: Create Parameter with device directly, don't call .to() afterwards!
+        # CRITICAL: Must explicitly set requires_grad=True!
         self.gammas = nn.ParameterList([
-            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype, device=device))
+            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype, device=device),
+                        requires_grad=True)
             for g in gammas
         ])
 
@@ -678,10 +679,11 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             self.name = name
 
         # Gamma parameters (trainable)
-        # CRITICAL: Create Parameter with device directly, don't call .to() afterwards!
-        # Calling .to() on a Parameter returns a Tensor, not a Parameter!
+        # CRITICAL: Must explicitly set requires_grad=True in Parameter constructor!
+        # torch.tensor() creates tensors with requires_grad=False by default
         self.gammas = nn.ParameterList([
-            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype, device=device))
+            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype, device=device),
+                        requires_grad=True)
             for g in gammas
         ])
 

@@ -108,9 +108,10 @@ class SVDTransformLayer(nn.Module):
                  weight_size = None, weight = None, 
                  bias = None, name = None, device = None):
         super(SVDTransformLayer, self).__init__()
-        # CRITICAL: Create Parameter with device directly in constructor!
-        # Direct attribute assignment requires this pattern
-        self.gamma = nn.Parameter(torch.tensor(gamma, dtype=computeSVD_dtype, device=device)) # gamma is trainable
+        # CRITICAL: Must explicitly set requires_grad=True!
+        # torch.tensor() creates tensors with requires_grad=False by default
+        self.gamma = nn.Parameter(torch.tensor(gamma, dtype=computeSVD_dtype, device=device),
+                                  requires_grad=True) # gamma is trainable
         if bias is None:
             self.ori = nn.Linear(input_size, output_size, bias=False).to(device)
         else:
