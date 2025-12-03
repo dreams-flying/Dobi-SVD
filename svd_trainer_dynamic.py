@@ -205,8 +205,18 @@ def main(args):
                 gamma_base =(1/RANK_RATIO)*target_compression_ratio*module.in_features*module.out_features/(module.in_features+module.out_features)
 
             # Initialize multiple gammas for different subspaces
-            # Strategy: low = 0.5 * base, mid = base, high = 1.5 * base
-            gamma_multipliers = args.gamma_multipliers if hasattr(args, 'gamma_multipliers') else [0.5, 1.0, 1.5]
+            # Strategy: Use layer-aware initialization for better compression
+            if args.use_layer_aware_gamma if hasattr(args, 'use_layer_aware_gamma') else False:
+                from utils.training_optimizers import compute_adaptive_gamma_multipliers
+                gamma_multipliers = compute_adaptive_gamma_multipliers(
+                    name,
+                    args.gamma_multipliers if hasattr(args, 'gamma_multipliers') else [0.5, 1.0, 1.5],
+                    n_subspaces
+                )
+                print(f"[Adaptive] Layer {name}: using adjusted multipliers {[f'{m:.2f}' for m in gamma_multipliers]}")
+            else:
+                gamma_multipliers = args.gamma_multipliers if hasattr(args, 'gamma_multipliers') else [0.5, 1.0, 1.5]
+
             gammas = [gamma_base * mult for mult in gamma_multipliers[:n_subspaces]]
 
             print(f"Layer {name}: gammas = {[f'{g:.2f}' for g in gammas]}")
@@ -383,6 +393,42 @@ def main(args):
         return penalty
 
     class DynamicSVDTrainer(Trainer):
+        def __init__(self, *args, **kwargs):
+            # Extract custom arguments before passing to parent
+            self.use_gamma_regularization = kwargs.pop('use_gamma_regularization', False)
+            self.use_temperature_scheduling = kwargs.pop('use_temperature_scheduling', False)
+            self.temp_scheduler = kwargs.pop('temp_scheduler', None)
+            self.gamma_regularizer = kwargs.pop('gamma_regularizer', None)
+
+            super().__init__(*args, **kwargs)
+
+            # Initialize step counter for temperature scheduling
+            self.training_step_counter = 0
+
+        def create_optimizer(self):
+            """Override to use differentiated learning rates for gamma parameters."""
+            if self.optimizer is None:
+                # Check if we should use differentiated learning rates
+                use_diff_lr = getattr(self.args, 'use_differentiated_lr', False)
+
+                if use_diff_lr:
+                    from utils.training_optimizers import setup_differentiated_optimizer
+                    gamma_lr = getattr(self.args, 'gamma_lr', 1e-3)
+                    other_lr = getattr(self.args, 'other_lr', 1e-4)
+                    weight_decay = getattr(self.args, 'weight_decay', 1e-5)
+
+                    self.optimizer = setup_differentiated_optimizer(
+                        self.model,
+                        gamma_lr=gamma_lr,
+                        other_lr=other_lr,
+                        weight_decay=weight_decay
+                    )
+                    print(f"[Optimizer] Using differentiated learning rates: "
+                          f"gamma_lr={gamma_lr}, other_lr={other_lr}")
+                else:
+                    # Use default optimizer
+                    super().create_optimizer()
+
         def compute_loss(self, model, inputs, return_outputs=False):
             actual_model = get_actual_model(model)
             outputs = model(**inputs)
@@ -401,7 +447,27 @@ def main(args):
             # Load balance loss (encourage balanced routing)
             balance_loss = compute_load_balance_loss(model) * lambda_balance
 
-            total_loss = loss + reg_loss + value_loss + balance_loss
+            # OPTIMIZATION: Add gamma regularization if enabled
+            gamma_reg_loss = torch.tensor(0.0, device=loss.device)
+            gamma_reg_stats = {}
+            if self.use_gamma_regularization and self.gamma_regularizer is not None:
+                gamma_reg_loss, gamma_reg_stats = self.gamma_regularizer.compute_loss(model)
+
+            # OPTIMIZATION: Update temperature if enabled
+            if self.use_temperature_scheduling and self.temp_scheduler is not None:
+                current_temp = self.temp_scheduler.get_temperature(self.training_step_counter)
+                # Update temperature in all routing modules
+                for module in model.modules():
+                    if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
+                        module.routing_temperature = current_temp
+
+                # Log temperature every 100 steps
+                if self.training_step_counter % 100 == 0:
+                    print(f"[TempScheduler] Step {self.training_step_counter}: temperature={current_temp:.3f}")
+
+                self.training_step_counter += 1
+
+            total_loss = loss + reg_loss + value_loss + balance_loss + gamma_reg_loss
 
             cur_lr = self.optimizer.param_groups[0]['lr']
 
@@ -411,7 +477,7 @@ def main(args):
 
                 # Save all gammas for each layer
                 for name, module in self.model.named_modules():
-                    if isinstance(module, MultiSubspaceSVDLayer):
+                    if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
                         k_dict[name] = {
                             'gammas': [g.detach().item() for g in module.gammas],
                             'routing_distribution': module.router.get_routing_distribution().cpu().tolist()
@@ -421,6 +487,10 @@ def main(args):
                 k_dict['compression_ratio'] = compression_ratio.detach().tolist()
                 k_dict['balance_loss'] = balance_loss.detach().tolist()
                 k_dict['lr'] = cur_lr
+
+                # Add gamma regularization stats if available
+                if gamma_reg_stats:
+                    k_dict['gamma_reg_stats'] = gamma_reg_stats
 
                 output_json_path = str(TA_tarined_model_output_dir/'k_dict_{:05d}.json'.format(actual_model.epoch_cnt))
                 with open(output_json_path, 'w') as json_file:
@@ -480,12 +550,47 @@ def main(args):
         remove_unused_columns=False,
     )
 
+    # OPTIMIZATION: Initialize advanced training optimizers if enabled
+    temp_scheduler = None
+    gamma_regularizer = None
+    use_temp_scheduling = args.use_temperature_scheduling
+    use_gamma_reg = args.use_gamma_regularization
+
+    if use_temp_scheduling:
+        from utils.training_optimizers import TemperatureScheduler
+        temp_scheduler = TemperatureScheduler(
+            initial_temp=args.temp_initial,
+            final_temp=args.temp_final,
+            decay_steps=args.temp_decay_steps,
+            decay_type=args.temp_decay_type
+        )
+        print(f"[Optimization] Temperature scheduling enabled: {args.temp_initial}→{args.temp_final} over {args.temp_decay_steps} steps ({args.temp_decay_type})")
+
+    if use_gamma_reg:
+        from utils.training_optimizers import GammaRegularizer
+        gamma_regularizer = GammaRegularizer(
+            l1_weight=args.gamma_l1_weight,
+            diversity_weight=args.gamma_diversity_weight
+        )
+        print(f"[Optimization] Gamma regularization enabled: L1={args.gamma_l1_weight}, Diversity={args.gamma_diversity_weight}")
+
+    # Add differentiated LR flag to training_args for trainer access
+    if args.use_differentiated_lr:
+        training_args.use_differentiated_lr = True
+        training_args.gamma_lr = args.gamma_lr
+        training_args.other_lr = args.other_lr
+        print(f"[Optimization] Differentiated learning rates: gamma_lr={args.gamma_lr}, other_lr={args.other_lr}")
+
     trainer = DynamicSVDTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_traindata,
         eval_dataset=tokenized_valdata,
         data_collator=data_collator,
+        use_temperature_scheduling=use_temp_scheduling,
+        use_gamma_regularization=use_gamma_reg,
+        temp_scheduler=temp_scheduler,
+        gamma_regularizer=gamma_regularizer,
     )
 
 
@@ -572,6 +677,36 @@ if __name__ == "__main__":
                        help='Rank for shared SVD (default: max_gamma + 10)')
     parser.add_argument('--use_gradient_checkpointing', action='store_true',
                        help='Enable gradient checkpointing for VRAM savings (trades 20%% compute for 20-30%% memory)')
+
+    # Advanced training optimizations
+    parser.add_argument('--use_temperature_scheduling', action='store_true',
+                       help='Enable adaptive temperature scheduling for routing (exploration→exploitation)')
+    parser.add_argument('--temp_initial', type=float, default=5.0,
+                       help='Initial temperature for routing (high=soft routing, default: 5.0)')
+    parser.add_argument('--temp_final', type=float, default=0.5,
+                       help='Final temperature for routing (low=hard routing, default: 0.5)')
+    parser.add_argument('--temp_decay_steps', type=int, default=5000,
+                       help='Number of steps to decay from initial to final temperature (default: 5000)')
+    parser.add_argument('--temp_decay_type', type=str, default='exponential',
+                       choices=['exponential', 'linear', 'cosine'],
+                       help='Temperature decay schedule type (default: exponential)')
+
+    parser.add_argument('--use_gamma_regularization', action='store_true',
+                       help='Enable gamma regularization (L1 + diversity loss) for better compression')
+    parser.add_argument('--gamma_l1_weight', type=float, default=0.01,
+                       help='Weight for L1 regularization on gammas (encourages compression, default: 0.01)')
+    parser.add_argument('--gamma_diversity_weight', type=float, default=0.001,
+                       help='Weight for diversity regularization on gammas (encourages differentiation, default: 0.001)')
+
+    parser.add_argument('--use_differentiated_lr', action='store_true',
+                       help='Use higher learning rate for gamma parameters (faster convergence)')
+    parser.add_argument('--gamma_lr', type=float, default=1e-3,
+                       help='Learning rate for gamma parameters (default: 1e-3, 10x higher than base)')
+    parser.add_argument('--other_lr', type=float, default=1e-4,
+                       help='Learning rate for non-gamma trainable parameters (default: 1e-4)')
+
+    parser.add_argument('--use_layer_aware_gamma', action='store_true',
+                       help='Use layer-specific gamma initialization based on importance (embedding > attention > MLP)')
 
     args = parser.parse_args()
     main(args)
