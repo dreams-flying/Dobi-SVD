@@ -219,7 +219,10 @@ def main(args):
 
             if use_shared:
                 # Use parameter-shared version (saves ~66% VRAM)
+                use_grad_ckpt = args.use_gradient_checkpointing if hasattr(args, 'use_gradient_checkpointing') else False
                 print(f"[SharedParam] Creating SharedParamMultiSubspaceSVDLayer for {name}")
+                if use_grad_ckpt:
+                    print(f"[SharedParam] Gradient checkpointing ENABLED for {name}")
                 NewLayer = SharedParamMultiSubspaceSVDLayer(
                     gammas=gammas,
                     n_subspaces=n_subspaces,
@@ -238,7 +241,8 @@ def main(args):
                     routing_temperature=routing_temperature,
                     advanced_routing=advanced_routing,
                     advanced_routing_kwargs=advanced_routing_kwargs,
-                    svd_rank=args.shared_svd_rank if hasattr(args, 'shared_svd_rank') else None
+                    svd_rank=args.shared_svd_rank if hasattr(args, 'shared_svd_rank') else None,
+                    use_gradient_checkpointing=use_grad_ckpt
                 )
             else:
                 # Use standard version (independent SVD per subspace)
@@ -566,6 +570,8 @@ if __name__ == "__main__":
                        help='Use SharedParamMultiSubspaceSVDLayer (shares U,V across subspaces, saves ~66% VRAM)')
     parser.add_argument('--shared_svd_rank', type=int, default=None,
                        help='Rank for shared SVD (default: max_gamma + 10)')
+    parser.add_argument('--use_gradient_checkpointing', action='store_true',
+                       help='Enable gradient checkpointing for VRAM savings (trades 20%% compute for 20-30%% memory)')
 
     args = parser.parse_args()
     main(args)
