@@ -22,12 +22,10 @@ class SVDTransformLayer(nn.Module):
         else:
             self.ALinear = nn.Linear(W_T.size(0), gamma, bias=False, device = device)
             self.BLinear = nn.Linear(gamma, W_T.size(1), bias=True, device = device)
-            # CRITICAL: Create Parameter with device, don't call .to() on Parameter
-            self.ALinear.bias = nn.Parameter(bias.to(device) if not bias.is_cuda else bias)
+            self.ALinear.bias = nn.Parameter(bias).to(device)
 
-        # CRITICAL: Create Parameter with device, don't call .to() on Parameter
-        self.ALinear.weight = nn.Parameter(A_weight_T.T.contiguous().to(device) if not A_weight_T.is_cuda else A_weight_T.T.contiguous())
-        self.BLinear.weight = nn.Parameter(B_weight_T.T.contiguous().to(device) if not B_weight_T.is_cuda else B_weight_T.T.contiguous()) 
+        self.ALinear.weight = nn.Parameter(A_weight_T.T.contiguous()).to(device)
+        self.BLinear.weight = nn.Parameter(B_weight_T.T.contiguous()).to(device) 
                 
     def forward(self, x):
         x = self.ALinear(x)
@@ -52,12 +50,10 @@ class SVDTransformLayer_remapping(nn.Module):
         else:
             self.ALinear = nn.Linear(weight1.size(0), weight1.size(1), bias=False, device = device)
             self.BLinear = nn.Linear(weight2.size(0), weight2.size(1), bias=True, device = device)
-            # CRITICAL: Create Parameter with device, don't call .to() on Parameter
-            self.ALinear.bias = nn.Parameter(bias.to(device) if not bias.is_cuda else bias)
+            self.ALinear.bias = nn.Parameter(bias).to(device)
 
-        # CRITICAL: Create Parameter with device, don't call .to() on Parameter
-        self.ALinear.weight = nn.Parameter(A_weight_T.T.contiguous().to(device) if not A_weight_T.is_cuda else A_weight_T.T.contiguous())
-        self.BLinear.weight = nn.Parameter(B_weight_T.T.contiguous().to(device) if not B_weight_T.is_cuda else B_weight_T.T.contiguous()) 
+        self.ALinear.weight = nn.Parameter(A_weight_T.T.contiguous()).to(device)
+        self.BLinear.weight = nn.Parameter(B_weight_T.T.contiguous()).to(device) 
                 
     def forward(self, x):
         x = self.ALinear(x)
