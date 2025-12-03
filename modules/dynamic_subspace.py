@@ -677,8 +677,10 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             self.name = name
 
         # Gamma parameters (trainable)
+        # CRITICAL: Create Parameter with device directly, don't call .to() afterwards!
+        # Calling .to() on a Parameter returns a Tensor, not a Parameter!
         self.gammas = nn.ParameterList([
-            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype)).to(device)
+            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype, device=device))
             for g in gammas
         ])
 
