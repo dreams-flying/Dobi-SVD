@@ -85,13 +85,14 @@ class TopKRouter(nn.Module):
 
         batch_size, seq_len = importance.shape
 
-        # Create scores for each subspace
-        # Method: Gaussian mixture centered at each subspace
-        scores = torch.zeros(batch_size, seq_len, self.n_subspaces, device=importance.device)
-
         # Normalize importance to [0, n_subspaces)
         normalized = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
         importance_scaled = normalized * (self.n_subspaces - 1)
+
+        # Create scores for each subspace
+        # Method: Gaussian mixture centered at each subspace
+        # CRITICAL: Initialize from importance to preserve gradient flow
+        scores = importance.unsqueeze(-1).expand(-1, -1, self.n_subspaces) * 0.0
 
         # Compute affinity to each subspace
         for i in range(self.n_subspaces):
@@ -107,8 +108,9 @@ class TopKRouter(nn.Module):
         routing_weights_topk = F.softmax(topk_scores, dim=-1)
 
         # Convert to full routing weights
-        routing_weights = torch.zeros_like(scores)
-        routing_weights.scatter_(-1, topk_indices, routing_weights_topk)
+        # CRITICAL: Use non-in-place scatter to preserve gradients
+        routing_weights = scores * 0.0  # Initialize from scores to preserve grad_fn
+        routing_weights = routing_weights.scatter(-1, topk_indices, routing_weights_topk)
 
         if squeeze_output:
             routing_weights = routing_weights.squeeze(0)
@@ -220,7 +222,9 @@ class ExpertChoiceRouter(nn.Module):
 
         # Pre-allocate routing and weights tensors
         routing = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=importance.device)
-        weights = torch.zeros(batch_size, seq_len, dtype=importance.dtype, device=importance.device)
+        # CRITICAL: Initialize weights from importance to preserve gradient flow!
+        # Using torch.zeros() creates a leaf tensor without grad_fn
+        weights = importance * 0.0  # Creates tensor with grad_fn connected to importance
 
         # Process each expert separately to save memory
         batch_idx = torch.arange(batch_size, device=importance.device).unsqueeze(1)
@@ -337,7 +341,8 @@ class SinkhornRouter(nn.Module):
         normalized = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
 
         # Create cost matrix (affinity between tokens and subspaces)
-        cost_matrix = torch.zeros(batch_size, seq_len, self.n_subspaces, device=importance.device)
+        # CRITICAL: Initialize from importance to preserve gradient flow
+        cost_matrix = importance.unsqueeze(-1).expand(-1, -1, self.n_subspaces) * 0.0
 
         for i in range(self.n_subspaces):
             # Subspace i prefers tokens with importance around i/(n-1)
@@ -549,13 +554,35 @@ class UnifiedRouter(nn.Module):
             if hard:
                 return routing
             else:
-                # Handle both 1D [seq_len] and 2D [batch, seq_len] weights
-                if weights.dim() == 1:
-                    # 1D: [seq_len] -> [seq_len, 1] -> [seq_len, n_subspaces]
-                    return weights.unsqueeze(-1).expand(-1, self.n_subspaces)
+                # For soft routing with expert_choice, convert to one-hot-like distribution
+                # Each token gets weight 1.0 for its assigned expert, 0.0 for others
+                # This preserves gradient flow while maintaining expert_choice behavior
+                if routing.dim() == 1:
+                    # 1D: [seq_len]
+                    batch_size = 1
+                    seq_len = routing.size(0)
+                    routing_2d = routing.unsqueeze(0)
                 else:
-                    # 2D: [batch, seq_len] -> [batch, seq_len, 1] -> [batch, seq_len, n_subspaces]
-                    return weights.unsqueeze(-1).expand(-1, -1, self.n_subspaces)
+                    # 2D: [batch, seq_len]
+                    batch_size, seq_len = routing.shape
+                    routing_2d = routing
+
+                # Create one-hot encoding of routing assignments
+                # CRITICAL: Initialize from importance to preserve gradient flow
+                if importance.dim() == 1:
+                    importance_2d = importance.unsqueeze(0)
+                else:
+                    importance_2d = importance
+                routing_weights = importance_2d.unsqueeze(-1).expand(-1, -1, self.n_subspaces) * 0.0
+
+                # Use scatter to create one-hot (preserves gradients through weights)
+                weights_to_scatter = weights.unsqueeze(-1).unsqueeze(-1) if weights.dim() == 1 else weights.unsqueeze(-1)
+                routing_weights.scatter_(2, routing_2d.unsqueeze(-1).long(), weights_to_scatter)
+
+                if routing.dim() == 1:
+                    routing_weights = routing_weights.squeeze(0)
+
+                return routing_weights
 
         elif self.strategy == 'sinkhorn':
             return self.router.route(importance, hard=hard)
