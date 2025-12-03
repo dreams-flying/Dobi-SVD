@@ -14,6 +14,7 @@ Key Components:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from .stable_svd import stable_lowrank_SVD, computeSVD_dtype, model_load_dtype, val_epsilon
 
 # Import advanced routing strategies
@@ -661,7 +662,8 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                  load_balance_weight=0.01,
                  advanced_routing=None,
                  advanced_routing_kwargs=None,
-                 svd_rank=None):
+                 svd_rank=None,
+                 use_gradient_checkpointing=False):
         super(SharedParamMultiSubspaceSVDLayer, self).__init__()
 
         assert gammas is not None and len(gammas) == n_subspaces, \
@@ -674,6 +676,7 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         self.load_balance_weight = load_balance_weight
         self.input_size = input_size
         self.output_size = output_size
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         if name:
             self.name = name
@@ -776,6 +779,52 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                   f"requires_grad={gamma.requires_grad}, "
                   f"value={gamma.item():.2f}")
 
+    def _forward_impl(self, x, routing_weights):
+        """
+        Checkpointable computation: Apply multi-subspace SVD with routing.
+
+        This function is separated to enable gradient checkpointing.
+        """
+        batch_size, seq_len, hidden_size = x.shape
+        device = x.device
+        input_dtype = x.dtype
+
+        x_flat = x.view(-1, hidden_size)
+        routing_weights_flat = routing_weights.view(-1, self.n_subspaces)
+
+        # Convert shared parameters
+        V_shared = self.V_shared.to(input_dtype)
+        S_shared = self.S_shared.to(input_dtype)
+        U_shared = self.U_shared.to(input_dtype)
+
+        # Pre-allocate buffer
+        xV_buffer = torch.empty(batch_size * seq_len, self.svd_rank,
+                               dtype=input_dtype, device=device)
+
+        output = None
+
+        for subspace_id, gamma in enumerate(self.gammas):
+            weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)
+
+            # Compute truncation
+            sequence = self.sequence_tensor.to(input_dtype)
+            gamma_val = gamma.clamp(min=1.0, max=float(self.svd_rank))
+            trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
+            S_truncated = S_shared * trunc
+
+            # Reconstruct with buffer reuse
+            torch.mm(x_flat, V_shared.T, out=xV_buffer)
+            xV_buffer.mul_(S_truncated.unsqueeze(0))
+            x_sub = xV_buffer @ U_shared.T
+            x_sub.mul_(weight)
+
+            if output is None:
+                output = x_sub
+            else:
+                output.add_(x_sub)
+
+        return output.view(batch_size, seq_len, self.output_size)
+
     def forward(self, x):
         """
         Forward pass with shared U,V and different gamma truncations.
@@ -803,13 +852,14 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # So x_transformed ≈ x @ V^T @ diag(S) @ U^T
 
         # Compute importance scores for routing
-        # Use the reconstructed activation for importance
-        x_approx = x_flat @ V_shared.T * S_shared.unsqueeze(0)
-        x_approx = x_approx @ U_shared.T
-
-        # Reshape for router
-        x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
-        importance = self.router.compute_importance(x_for_routing)
+        # MEMORY OPTIMIZATION: Compute x_approx in-place and free immediately
+        with torch.no_grad():  # Don't need gradients for routing
+            x_approx = x_flat @ V_shared.T
+            x_approx *= S_shared.unsqueeze(0)
+            x_approx = x_approx @ U_shared.T
+            x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
+            importance = self.router.compute_importance(x_for_routing)
+            del x_approx, x_for_routing  # Explicitly free memory
 
         # Cache for analysis
         if not self.training:
@@ -827,59 +877,15 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 hard=False
             )  # [batch, seq, n_subspaces]
 
-            # Flatten routing weights
-            routing_weights_flat = routing_weights.view(-1, self.n_subspaces)  # [batch*seq, n_subspaces]
+            # MEMORY OPTIMIZATION: Use gradient checkpointing if enabled
+            # This trades compute for memory by recomputing activations during backward
+            if self.training and self.use_gradient_checkpointing:
+                output = checkpoint(self._forward_impl, x, routing_weights, use_reentrant=False)
+            else:
+                output = self._forward_impl(x, routing_weights)
 
-            # Initialize output as None - will be created on first accumulation
-            output = None
-
-            # ========================================
-            # 关键: 对每个子空间应用不同的gamma截断
-            # ========================================
-
-            for subspace_id, gamma in enumerate(self.gammas):
-                # Get routing weight for this subspace
-                weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)  # [batch*seq, 1]
-
-                # DON'T SKIP - always process to maintain gradient flow
-                # Even small weights contribute to gradients for gamma parameters
-
-                # Compute truncation function for this gamma
-                # OPTIMIZATION: Use precomputed sequence tensor and convert to input dtype
-                sequence = self.sequence_tensor.to(input_dtype)
-
-                # Clamp gamma to valid range [1, svd_rank]
-                gamma_val = gamma.clamp(min=1.0, max=float(self.svd_rank))
-
-                # Smooth truncation: sigmoid-like function centered at gamma
-                trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
-
-                # Apply truncation to shared singular values
-                S_truncated = S_shared * trunc  # [svd_rank]
-
-                # Reconstruct: x_sub = x @ V^T @ diag(S_truncated) @ U^T
-                # Step 1: x @ V^T
-                xV = x_flat @ V_shared.T  # [batch*seq, svd_rank]
-
-                # Step 2: multiply by truncated S
-                xVS = xV * S_truncated.unsqueeze(0)  # [batch*seq, svd_rank]
-
-                # Step 3: @ U^T
-                x_sub = xVS @ U_shared.T  # [batch*seq, output_size]
-
-                # Weight and accumulate
-                weighted_sub = weight * x_sub
-
-                if output is None:
-                    # First subspace - initialize output
-                    output = weighted_sub
-                else:
-                    # Subsequent subspaces - accumulate
-                    output = output + weighted_sub
-
-            # Output should always be set now (we process all subspaces)
             # Convert to model dtype for subsequent layers
-            real_x = output.view(batch_size, seq_len, self.output_size).to(model_load_dtype)
+            real_x = output.to(model_load_dtype)
 
             # DEBUG: Check gradient flow
             if hasattr(self, '_debug_count'):
