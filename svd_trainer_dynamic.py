@@ -307,7 +307,8 @@ def main(args):
         param.requires_grad = False
 
     for module in model.modules():
-        if isinstance(module, MultiSubspaceSVDLayer):
+        # Handle both MultiSubspaceSVDLayer and SharedParamMultiSubspaceSVDLayer
+        if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
             # Make all gammas trainable
             for gamma in module.gammas:
                 gamma.requires_grad = True
