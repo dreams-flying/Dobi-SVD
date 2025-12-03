@@ -823,9 +823,8 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 # Get routing weight for this subspace
                 weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)  # [batch*seq, 1]
 
-                # Skip if weight is negligible
-                if weight.abs().max() < 1e-6:
-                    continue
+                # DON'T SKIP - always process to maintain gradient flow
+                # Even small weights contribute to gradients for gamma parameters
 
                 # Compute truncation function for this gamma
                 sequence = torch.arange(1, len(S_shared) + 1,
@@ -857,14 +856,8 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                     # Subsequent subspaces - accumulate
                     output = output + weighted_sub
 
-                # Free memory
-                del xV, xVS, x_sub, weighted_sub, sequence, trunc, S_truncated
-
-            # If no subspace was processed (unlikely), create zero output
-            if output is None:
-                output = torch.zeros(batch_size * seq_len, self.output_size,
-                                   device=device, dtype=input_dtype)
-
+            # Output should always be set now (we process all subspaces)
+            # Convert to model dtype for subsequent layers
             real_x = output.view(batch_size, seq_len, self.output_size).to(model_load_dtype)
 
         else:
