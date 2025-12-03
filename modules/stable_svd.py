@@ -108,13 +108,16 @@ class SVDTransformLayer(nn.Module):
                  weight_size = None, weight = None, 
                  bias = None, name = None, device = None):
         super(SVDTransformLayer, self).__init__()
-        self.gamma = nn.Parameter(torch.tensor(gamma, dtype=computeSVD_dtype)).to(device) # gamma is trainable
+        # CRITICAL: Create Parameter with device directly, don't call .to() afterwards!
+        self.gamma = nn.Parameter(torch.tensor(gamma, dtype=computeSVD_dtype, device=device)) # gamma is trainable
         if bias is None:
             self.ori = nn.Linear(input_size, output_size, bias=False).to(device)
         else:
             self.ori = nn.Linear(input_size, output_size, bias=True).to(device)
-            self.ori.bias = nn.Parameter(bias).to(device)
-        self.ori.weight = nn.Parameter(weight).to(device)
+            # CRITICAL: Create Parameter with device, don't call .to() on Parameter
+            self.ori.bias = nn.Parameter(bias.to(device) if not bias.is_cuda else bias)
+        # CRITICAL: Create Parameter with device, don't call .to() on Parameter
+        self.ori.weight = nn.Parameter(weight.to(device) if not weight.is_cuda else weight)
         if name:
             self.name = name
         self.ori_weight_size = weight_size

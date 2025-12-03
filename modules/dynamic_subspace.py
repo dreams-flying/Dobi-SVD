@@ -352,8 +352,9 @@ class MultiSubspaceSVDLayer(nn.Module):
         self.load_balance_weight = load_balance_weight
 
         # Create parameter list for gammas (all trainable)
+        # CRITICAL: Create Parameter with device directly, don't call .to() afterwards!
         self.gammas = nn.ParameterList([
-            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype)).to(device)
+            nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype, device=device))
             for g in gammas
         ])
 
@@ -365,8 +366,10 @@ class MultiSubspaceSVDLayer(nn.Module):
             self.ori = nn.Linear(input_size, output_size, bias=False).to(device)
         else:
             self.ori = nn.Linear(input_size, output_size, bias=True).to(device)
-            self.ori.bias = nn.Parameter(bias).to(device)
-        self.ori.weight = nn.Parameter(weight).to(device)
+            # CRITICAL: Create Parameter with device, don't call .to() on Parameter
+            self.ori.bias = nn.Parameter(bias.to(device) if not bias.is_cuda else bias)
+        # CRITICAL: Create Parameter with device, don't call .to() on Parameter
+        self.ori.weight = nn.Parameter(weight.to(device) if not weight.is_cuda else weight)
 
         # Size info for compression calculation
         self.ori_weight_size = weight_size
