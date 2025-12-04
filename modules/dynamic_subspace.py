@@ -298,8 +298,12 @@ class TokenRouter(nn.Module):
     def get_routing_distribution(self):
         """Get the distribution of tokens across subspaces."""
         if self.total_tokens == 0:
-            return torch.zeros(self.n_subspaces)
-        return self.routing_counts / self.total_tokens
+            # Return uniform distribution when no tokens have been routed yet
+            return torch.ones(self.n_subspaces, device=self.routing_counts.device) / self.n_subspaces
+
+        distribution = self.routing_counts / self.total_tokens
+        # Ensure numerical stability: clamp to prevent exact zeros
+        return torch.clamp(distribution, min=1e-8)
 
     def reset_statistics(self):
         """Reset routing statistics."""
@@ -573,14 +577,23 @@ def compute_load_balance_loss(model, target_distribution=None):
             else:
                 target = target_distribution
 
-            # KL divergence loss
+            # KL divergence loss with numerical stability
+            # Add epsilon to prevent log(0) which causes NaN
+            eps = 1e-8
+            distribution_safe = torch.clamp(distribution, min=eps)
+            target_safe = torch.clamp(target, min=eps)
+
+            # Use F.kl_div with log_target=False (target is not in log space)
             loss = F.kl_div(
-                distribution.log(),
-                target,
+                distribution_safe.log(),
+                target_safe,
                 reduction='batchmean'
             )
-            total_loss += loss
-            n_layers += 1
+
+            # Check for NaN and skip if invalid
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                total_loss += loss
+                n_layers += 1
 
     if n_layers == 0:
         return torch.tensor(0.0)

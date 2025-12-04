@@ -433,10 +433,18 @@ def main(args):
             actual_model = get_actual_model(model)
             outputs = model(**inputs)
 
+            # Get cross-entropy loss (negative log likelihood)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             neg_log_likelihood = loss
-            ppl = torch.exp(neg_log_likelihood)
-            loss = ppl
+
+            # Compute PPL for logging only (with numerical stability)
+            # Clamp NLL to prevent overflow: exp(20) = 485M is already huge
+            clamped_nll = torch.clamp(neg_log_likelihood, max=20.0)
+            ppl = torch.exp(clamped_nll)
+
+            # IMPORTANT: Use NLL as loss, NOT PPL!
+            # PPL is only for monitoring/logging
+            loss = neg_log_likelihood
 
             # Compression regularization
             reg_loss, compression_ratio = calculate_compression_loss(model, target_compression_ratio, lambda_reg)
@@ -468,6 +476,22 @@ def main(args):
                 self.training_step_counter += 1
 
             total_loss = loss + reg_loss + value_loss + balance_loss + gamma_reg_loss
+
+            # Check for NaN/Inf and provide detailed error message
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"[ERROR] NaN/Inf detected in loss computation:")
+                print(f"  - task_loss (NLL): {loss.item() if not torch.isnan(loss) else 'NaN'}")
+                print(f"  - reg_loss: {reg_loss.item() if not torch.isnan(reg_loss) else 'NaN'}")
+                print(f"  - value_loss: {value_loss.item() if not torch.isnan(value_loss) else 'NaN'}")
+                print(f"  - balance_loss: {balance_loss.item() if not torch.isnan(balance_loss) else 'NaN'}")
+                print(f"  - gamma_reg_loss: {gamma_reg_loss.item() if not torch.isnan(gamma_reg_loss) else 'NaN'}")
+                print(f"  - total_loss: {total_loss.item() if not torch.isnan(total_loss) else 'NaN'}")
+
+                # Replace NaN with a large but finite value to continue training
+                total_loss = torch.where(torch.isnan(total_loss) | torch.isinf(total_loss),
+                                        torch.tensor(1e6, device=total_loss.device),
+                                        total_loss)
+                print(f"  - Replaced with: {total_loss.item()}")
 
             cur_lr = self.optimizer.param_groups[0]['lr']
 

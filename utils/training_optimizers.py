@@ -140,9 +140,18 @@ class GammaRegularizer:
         if n_layers > 0:
             l1_loss = l1_loss / n_layers
             diversity_loss = diversity_loss / n_layers
+        else:
+            # No SVD layers found, return zero loss
+            device = next(model.parameters()).device
+            return torch.tensor(0.0, device=device), {'gamma_l1': 0.0, 'gamma_diversity': 0.0, 'gamma_reg_total': 0.0, 'n_layers': 0}
 
         # Combine losses
         total_loss = self.l1_weight * l1_loss + self.diversity_weight * diversity_loss
+
+        # Ensure losses are tensors for proper device handling
+        if not isinstance(total_loss, torch.Tensor):
+            device = next(model.parameters()).device
+            total_loss = torch.tensor(total_loss, device=device)
 
         stats = {
             'gamma_l1': l1_loss.item() if isinstance(l1_loss, torch.Tensor) else 0.0,
