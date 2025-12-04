@@ -797,11 +797,17 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         S_shared = self.S_shared.to(input_dtype)
         U_shared = self.U_shared.to(input_dtype)
 
-        # Pre-allocate buffer
-        xV_buffer = torch.empty(batch_size * seq_len, self.svd_rank,
-                               dtype=input_dtype, device=device)
-
         output = None
+
+        # IMPORTANT: When gradient checkpointing is enabled, we CANNOT use out= parameter
+        # because it doesn't support automatic differentiation (autograd)
+        # So we use buffer reuse only when checkpointing is disabled
+        use_buffer_reuse = not self.use_gradient_checkpointing
+
+        if use_buffer_reuse:
+            # Pre-allocate buffer for memory optimization
+            xV_buffer = torch.empty(batch_size * seq_len, self.svd_rank,
+                                   dtype=input_dtype, device=device)
 
         for subspace_id, gamma in enumerate(self.gammas):
             weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)
@@ -812,11 +818,19 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
             S_truncated = S_shared * trunc
 
-            # Reconstruct with buffer reuse
-            torch.mm(x_flat, V_shared.T, out=xV_buffer)
-            xV_buffer.mul_(S_truncated.unsqueeze(0))
-            x_sub = xV_buffer @ U_shared.T
-            x_sub.mul_(weight)
+            # Reconstruct: choose between buffer reuse (faster) or regular ops (autograd-safe)
+            if use_buffer_reuse:
+                # Buffer reuse version: faster but incompatible with gradient checkpointing
+                torch.mm(x_flat, V_shared.T, out=xV_buffer)
+                xV_buffer.mul_(S_truncated.unsqueeze(0))
+                x_sub = xV_buffer @ U_shared.T
+                x_sub.mul_(weight)
+            else:
+                # Regular version: compatible with gradient checkpointing
+                xV = x_flat @ V_shared.T
+                xV = xV * S_truncated.unsqueeze(0)
+                x_sub = xV @ U_shared.T
+                x_sub = x_sub * weight
 
             if output is None:
                 output = x_sub
