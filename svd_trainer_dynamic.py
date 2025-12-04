@@ -669,7 +669,7 @@ if __name__ == "__main__":
     parser.add_argument('--seq_len', type=int, default=2048)
     parser.add_argument('--n_train_samples', type=int, default=128)
     parser.add_argument('--n_eval_samples', type=int, default=64)
-    parser.add_argument('--BETA', type=float, default=100.0)
+    parser.add_argument('--BETA', type=float, default=10.0)  # Reduced from 100.0 for numerical stability
     parser.add_argument('--n_train_epochs', type=int, default=5)
     parser.add_argument('--warmup_steps', type=int, default=10)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4)

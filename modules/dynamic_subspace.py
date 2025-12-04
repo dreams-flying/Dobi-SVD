@@ -825,11 +825,25 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         for subspace_id, gamma in enumerate(self.gammas):
             weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)
 
-            # Compute truncation
+            # Compute truncation with numerical stability
             sequence = self.sequence_tensor.to(input_dtype)
             gamma_val = gamma.clamp(min=1.0, max=float(self.svd_rank))
-            trunc = 0.5 * torch.tanh(self.beta * (gamma_val - sequence)) + 0.5
+
+            # NUMERICAL STABILITY: Clamp beta argument to prevent overflow
+            # tanh saturates at ~±20, so clamp input to tanh to [-20, 20]
+            beta_arg = self.beta * (gamma_val - sequence)
+            beta_arg = torch.clamp(beta_arg, min=-20.0, max=20.0)
+            trunc = 0.5 * torch.tanh(beta_arg) + 0.5
+
             S_truncated = S_shared * trunc
+
+            # NUMERICAL STABILITY: Check for NaN in truncation
+            if torch.isnan(S_truncated).any() or torch.isinf(S_truncated).any():
+                print(f"[ERROR] NaN/Inf in S_truncated for subspace {subspace_id}")
+                print(f"  gamma_val: {gamma_val.item()}, beta: {self.beta}")
+                print(f"  S_shared range: [{S_shared.min().item():.2e}, {S_shared.max().item():.2e}]")
+                print(f"  trunc range: [{trunc.min().item():.2e}, {trunc.max().item():.2e}]")
+                S_truncated = torch.nan_to_num(S_truncated, nan=1e-6, posinf=1e4, neginf=-1e4)
 
             # Reconstruct: choose between buffer reuse (faster) or regular ops (autograd-safe)
             if use_buffer_reuse:
@@ -850,7 +864,19 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             else:
                 output.add_(x_sub)
 
-        return output.view(batch_size, seq_len, self.output_size)
+        # NUMERICAL STABILITY: Final output check
+        output_reshaped = output.view(batch_size, seq_len, self.output_size)
+
+        if torch.isnan(output_reshaped).any() or torch.isinf(output_reshaped).any():
+            print(f"[ERROR] NaN/Inf in final output of SharedParamMultiSubspaceSVDLayer")
+            print(f"  Output shape: {output_reshaped.shape}")
+            print(f"  NaN count: {torch.isnan(output_reshaped).sum().item()}")
+            print(f"  Inf count: {torch.isinf(output_reshaped).sum().item()}")
+            print(f"  Output range: [{output_reshaped[~torch.isnan(output_reshaped) & ~torch.isinf(output_reshaped)].min().item():.2e}, "
+                  f"{output_reshaped[~torch.isnan(output_reshaped) & ~torch.isinf(output_reshaped)].max().item():.2e}]")
+            output_reshaped = torch.nan_to_num(output_reshaped, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        return output_reshaped
 
     def forward(self, x):
         """
@@ -866,6 +892,11 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         device = x.device
         input_dtype = x.dtype  # Get input dtype (could be FP16 or FP32)
 
+        # NUMERICAL STABILITY: Check input for NaN/Inf
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"[WARNING] NaN/Inf in input to SharedParamMultiSubspaceSVDLayer")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
         # Flatten for processing
         x_flat = x.view(-1, hidden_size)  # [batch*seq, hidden]
 
@@ -873,6 +904,15 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         V_shared = self.V_shared.to(input_dtype)
         S_shared = self.S_shared.to(input_dtype)
         U_shared = self.U_shared.to(input_dtype)
+
+        # NUMERICAL STABILITY: Check SVD parameters
+        if torch.isnan(V_shared).any() or torch.isnan(S_shared).any() or torch.isnan(U_shared).any():
+            print(f"[ERROR] NaN in SVD parameters! V: {torch.isnan(V_shared).any()}, S: {torch.isnan(S_shared).any()}, U: {torch.isnan(U_shared).any()}")
+            # This shouldn't happen - SVD params should be frozen
+            return torch.zeros(batch_size, seq_len, self.output_size, device=device, dtype=input_dtype)
+
+        # NUMERICAL STABILITY: Clamp singular values to prevent extreme values
+        S_shared = torch.clamp(S_shared, min=1e-6, max=1e4)
 
         # Linear transformation: x_transformed = x @ W^T
         # Where W ≈ U @ diag(S) @ V (SVD approximation)
