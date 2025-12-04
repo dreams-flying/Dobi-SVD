@@ -478,20 +478,35 @@ def main(args):
             total_loss = loss + reg_loss + value_loss + balance_loss + gamma_reg_loss
 
             # Check for NaN/Inf and provide detailed error message
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                print(f"[ERROR] NaN/Inf detected in loss computation:")
-                print(f"  - task_loss (NLL): {loss.item() if not torch.isnan(loss) else 'NaN'}")
-                print(f"  - reg_loss: {reg_loss.item() if not torch.isnan(reg_loss) else 'NaN'}")
-                print(f"  - value_loss: {value_loss.item() if not torch.isnan(value_loss) else 'NaN'}")
-                print(f"  - balance_loss: {balance_loss.item() if not torch.isnan(balance_loss) else 'NaN'}")
-                print(f"  - gamma_reg_loss: {gamma_reg_loss.item() if not torch.isnan(gamma_reg_loss) else 'NaN'}")
-                print(f"  - total_loss: {total_loss.item() if not torch.isnan(total_loss) else 'NaN'}")
+            # Use .any() to handle multi-element tensors
+            is_nan_or_inf = torch.isnan(total_loss).any() or torch.isinf(total_loss).any()
 
-                # Replace NaN with a large but finite value to continue training
-                total_loss = torch.where(torch.isnan(total_loss) | torch.isinf(total_loss),
-                                        torch.tensor(1e6, device=total_loss.device),
-                                        total_loss)
-                print(f"  - Replaced with: {total_loss.item()}")
+            if is_nan_or_inf:
+                print(f"[ERROR] NaN/Inf detected in loss computation:")
+
+                # Safe item extraction
+                def safe_item(tensor):
+                    try:
+                        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                            return 'NaN/Inf'
+                        return tensor.item() if tensor.numel() == 1 else tensor.mean().item()
+                    except:
+                        return 'Error'
+
+                print(f"  - task_loss (NLL): {safe_item(loss)}")
+                print(f"  - reg_loss: {safe_item(reg_loss)}")
+                print(f"  - value_loss: {safe_item(value_loss)}")
+                print(f"  - balance_loss: {safe_item(balance_loss)}")
+                print(f"  - gamma_reg_loss: {safe_item(gamma_reg_loss) if isinstance(gamma_reg_loss, torch.Tensor) else gamma_reg_loss}")
+                print(f"  - total_loss: {safe_item(total_loss)}")
+
+                # Replace NaN/Inf with a large but finite value to continue training
+                total_loss = torch.where(
+                    torch.isnan(total_loss) | torch.isinf(total_loss),
+                    torch.tensor(1e6, device=total_loss.device, dtype=total_loss.dtype),
+                    total_loss
+                )
+                print(f"  - Replaced with: {safe_item(total_loss)}")
 
             cur_lr = self.optimizer.param_groups[0]['lr']
 
