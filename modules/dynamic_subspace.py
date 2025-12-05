@@ -825,6 +825,9 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         for subspace_id, gamma in enumerate(self.gammas):
             weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)
 
+            # DEBUG: Enable detailed NaN tracking for first subspace
+            debug_nan = (subspace_id == 0)
+
             # Compute truncation with numerical stability
             sequence = self.sequence_tensor.to(input_dtype)
             gamma_val = gamma.clamp(min=1.0, max=float(self.svd_rank))
@@ -855,9 +858,37 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             else:
                 # Regular version: compatible with gradient checkpointing
                 xV = x_flat @ V_shared.T
+
+                # DEBUG: Check after x @ V
+                if debug_nan and (torch.isnan(xV).any() or torch.isinf(xV).any()):
+                    print(f"[DEBUG] NaN/Inf after x @ V.T")
+                    print(f"  x_flat: NaN={torch.isnan(x_flat).any()}, range=[{x_flat.min():.2e}, {x_flat.max():.2e}]")
+                    print(f"  V_shared: NaN={torch.isnan(V_shared).any()}, range=[{V_shared.min():.2e}, {V_shared.max():.2e}]")
+                    print(f"  xV: NaN count={torch.isnan(xV).sum()}, Inf count={torch.isinf(xV).sum()}")
+
                 xV = xV * S_truncated.unsqueeze(0)
+
+                # DEBUG: Check after * S
+                if debug_nan and (torch.isnan(xV).any() or torch.isinf(xV).any()):
+                    print(f"[DEBUG] NaN/Inf after xV * S_truncated")
+                    print(f"  S_truncated: range=[{S_truncated.min():.2e}, {S_truncated.max():.2e}]")
+                    print(f"  xV: NaN count={torch.isnan(xV).sum()}")
+
                 x_sub = xV @ U_shared.T
+
+                # DEBUG: Check after @ U
+                if debug_nan and (torch.isnan(x_sub).any() or torch.isinf(x_sub).any()):
+                    print(f"[DEBUG] NaN/Inf after xV @ U.T")
+                    print(f"  U_shared: NaN={torch.isnan(U_shared).any()}, range=[{U_shared.min():.2e}, {U_shared.max():.2e}]")
+                    print(f"  x_sub: NaN count={torch.isnan(x_sub).sum()}")
+
                 x_sub = x_sub * weight
+
+                # DEBUG: Check after * weight
+                if debug_nan and (torch.isnan(x_sub).any() or torch.isinf(x_sub).any()):
+                    print(f"[DEBUG] NaN/Inf after x_sub * weight")
+                    print(f"  weight: NaN={torch.isnan(weight).any()}, range=[{weight.min():.2e}, {weight.max():.2e}]")
+                    print(f"  x_sub: NaN count={torch.isnan(x_sub).sum()}")
 
             if output is None:
                 output = x_sub
@@ -870,10 +901,21 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         if torch.isnan(output_reshaped).any() or torch.isinf(output_reshaped).any():
             print(f"[ERROR] NaN/Inf in final output of SharedParamMultiSubspaceSVDLayer")
             print(f"  Output shape: {output_reshaped.shape}")
-            print(f"  NaN count: {torch.isnan(output_reshaped).sum().item()}")
-            print(f"  Inf count: {torch.isinf(output_reshaped).sum().item()}")
-            print(f"  Output range: [{output_reshaped[~torch.isnan(output_reshaped) & ~torch.isinf(output_reshaped)].min().item():.2e}, "
-                  f"{output_reshaped[~torch.isnan(output_reshaped) & ~torch.isinf(output_reshaped)].max().item():.2e}]")
+            nan_count = torch.isnan(output_reshaped).sum().item()
+            inf_count = torch.isinf(output_reshaped).sum().item()
+            total_elements = output_reshaped.numel()
+            print(f"  NaN count: {nan_count} / {total_elements} ({100*nan_count/total_elements:.1f}%)")
+            print(f"  Inf count: {inf_count} / {total_elements} ({100*inf_count/total_elements:.1f}%)")
+
+            # Only try to print range if there are valid values
+            valid_mask = ~torch.isnan(output_reshaped) & ~torch.isinf(output_reshaped)
+            if valid_mask.any():
+                valid_values = output_reshaped[valid_mask]
+                print(f"  Valid values range: [{valid_values.min().item():.2e}, {valid_values.max().item():.2e}]")
+            else:
+                print(f"  WARNING: ALL outputs are NaN/Inf! This is a critical failure.")
+                print(f"  Check gamma values, routing weights, and input data.")
+
             output_reshaped = torch.nan_to_num(output_reshaped, nan=0.0, posinf=1e4, neginf=-1e4)
 
         return output_reshaped
