@@ -162,9 +162,17 @@ class TokenRouter(nn.Module):
                 # Use self-similarity as attention proxy + value norms
                 # This preserves VATP's key insight while being practical
 
+                # NUMERICAL STABILITY: Check input before normalization
+                x_norm_check = x.norm(dim=-1, p=2)
+                if (x_norm_check < 1e-8).any():
+                    # Some tokens have near-zero norm, add small epsilon to avoid NaN in normalize
+                    x_safe = x + 1e-8
+                else:
+                    x_safe = x
+
                 # Compute self-similarity (cosine similarity between tokens)
                 # Normalize activations
-                x_norm = F.normalize(x, p=2, dim=-1)  # [batch, seq, hidden]
+                x_norm = F.normalize(x_safe, p=2, dim=-1, eps=1e-8)  # [batch, seq, hidden]
 
                 # Compute pairwise similarity (approximates attention pattern)
                 # similarity[i,j] = how similar token i is to token j
@@ -184,7 +192,14 @@ class TokenRouter(nn.Module):
                 importance = avg_similarity * value_norms
 
                 # Re-normalize to [0, 1] for stability
-                importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
+                importance_min = importance.min()
+                importance_max = importance.max()
+                importance_range = importance_max - importance_min
+                # Prevent division by zero
+                if importance_range < 1e-10:
+                    importance = torch.ones_like(importance) * 0.5
+                else:
+                    importance = (importance - importance_min) / (importance_range + 1e-10)
 
         elif self.routing_strategy == 'learned':
             # Learnable importance predictor (TokenButler-style)
@@ -222,6 +237,17 @@ class TokenRouter(nn.Module):
 
         else:
             raise ValueError(f"Unknown routing strategy: {self.routing_strategy}")
+
+        # NUMERICAL STABILITY: Check for NaN/Inf in importance scores
+        if torch.isnan(importance).any() or torch.isinf(importance).any():
+            print(f"[ERROR] NaN/Inf detected in importance computation (strategy={self.routing_strategy})")
+            print(f"  Input x: NaN={torch.isnan(x).any()}, Inf={torch.isinf(x).any()}")
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                print(f"  x range: min={x[~torch.isnan(x) & ~torch.isinf(x)].min():.2e}, max={x[~torch.isnan(x) & ~torch.isinf(x)].max():.2e}")
+            print(f"  importance NaN count: {torch.isnan(importance).sum()}, Inf count: {torch.isinf(importance).sum()}")
+            # Replace NaN/Inf with safe fallback (uniform importance)
+            importance = torch.nan_to_num(importance, nan=0.5, posinf=1.0, neginf=0.0)
+            print(f"  Replaced with safe values, new range: [{importance.min():.2e}, {importance.max():.2e}]")
 
         return importance
 
@@ -290,8 +316,26 @@ class TokenRouter(nn.Module):
                     mid_point = self.thresholds[i - 1]
                     routing_logits[..., i] = -torch.abs(normalized_importance - mid_point)
 
+            # NUMERICAL STABILITY: Check routing_logits before softmax
+            if torch.isnan(routing_logits).any() or torch.isinf(routing_logits).any():
+                print(f"[ERROR] NaN/Inf in routing_logits before softmax")
+                print(f"  routing_logits NaN: {torch.isnan(routing_logits).sum()}, Inf: {torch.isinf(routing_logits).sum()}")
+                print(f"  normalized_importance: NaN={torch.isnan(normalized_importance).any()}, range=[{normalized_importance.min():.2e}, {normalized_importance.max():.2e}]")
+                routing_logits = torch.nan_to_num(routing_logits, nan=-10.0, posinf=10.0, neginf=-10.0)
+
             # Apply temperature and softmax
-            routing_probs = F.softmax(routing_logits / temperature, dim=-1)
+            scaled_logits = routing_logits / max(temperature, 1e-6)  # Prevent division by very small temperature
+
+            # NUMERICAL STABILITY: Clamp scaled logits to prevent overflow in exp()
+            scaled_logits = torch.clamp(scaled_logits, min=-20.0, max=20.0)
+
+            routing_probs = F.softmax(scaled_logits, dim=-1)
+
+            # NUMERICAL STABILITY: Final check for NaN in routing_probs
+            if torch.isnan(routing_probs).any() or torch.isinf(routing_probs).any():
+                print(f"[ERROR] NaN/Inf in routing_probs after softmax!")
+                print(f"  This should not happen. Falling back to uniform distribution.")
+                routing_probs = torch.ones_like(routing_probs) / self.n_subspaces
 
             return routing_probs
 
@@ -966,8 +1010,30 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # 2. Routing to adapt based on which tokens benefit from which subspaces
         # 3. Better gradient signal for gamma parameters
         x_approx = x_flat @ V_shared.T
+
+        # NUMERICAL STABILITY: Check intermediate result
+        if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
+            print(f"[ERROR] NaN/Inf after x @ V.T in routing computation")
+            print(f"  x_flat range: [{x_flat.min():.2e}, {x_flat.max():.2e}]")
+            print(f"  V_shared range: [{V_shared.min():.2e}, {V_shared.max():.2e}]")
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1e4, neginf=-1e4)
+
         x_approx = x_approx * S_shared.unsqueeze(0)
+
+        # NUMERICAL STABILITY: Check after scaling
+        if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
+            print(f"[ERROR] NaN/Inf after x_approx * S in routing computation")
+            print(f"  S_shared range: [{S_shared.min():.2e}, {S_shared.max():.2e}]")
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1e4, neginf=-1e4)
+
         x_approx = x_approx @ U_shared.T
+
+        # NUMERICAL STABILITY: Check final routing input
+        if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
+            print(f"[ERROR] NaN/Inf after x_approx @ U.T in routing computation")
+            print(f"  U_shared range: [{U_shared.min():.2e}, {U_shared.max():.2e}]")
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1e4, neginf=-1e4)
+
         x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
         importance = self.router.compute_importance(x_for_routing)
 
