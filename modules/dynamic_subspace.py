@@ -263,6 +263,28 @@ class TokenRouter(nn.Module):
         Returns:
             routing: Routing assignments [batch, seq_len] (hard) or [batch, seq_len, n_subspaces] (soft)
         """
+        # NUMERICAL STABILITY: Handle uniform importance case BEFORE routing
+        # This applies to ALL routing strategies (advanced and default)
+        importance_min = importance.min()
+        importance_max = importance.max()
+        importance_range = importance_max - importance_min
+
+        if importance_range < 1e-10:
+            # All importance values are the same (uniform distribution)
+            # Return uniform routing for soft, or assign all to subspace 0 for hard
+            print(f"[INFO] Uniform importance detected (range={importance_range:.2e}). Using uniform routing.")
+            if not hard:
+                batch_size = importance.size(0) if importance.dim() > 1 else 1
+                seq_len = importance.size(-1) if importance.dim() > 1 else importance.size(0)
+                if importance.dim() == 1:
+                    routing_probs = torch.ones(seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
+                else:
+                    routing_probs = torch.ones(batch_size, seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
+                return routing_probs
+            else:
+                # For hard routing, assign all to subspace 0
+                return torch.zeros_like(importance, dtype=torch.long)
+
         # Use advanced router if specified
         if self.advanced_router is not None:
             if hard:
@@ -280,26 +302,7 @@ class TokenRouter(nn.Module):
 
         # Default threshold-based routing
         # Normalize importance to [0, 1]
-        importance_min = importance.min()
-        importance_max = importance.max()
-
-        # NUMERICAL STABILITY: Handle uniform importance case
-        importance_range = importance_max - importance_min
-        if importance_range < 1e-10:
-            # All importance values are the same (uniform distribution)
-            # Return uniform routing weights
-            if not hard:
-                batch_size = importance.size(0) if importance.dim() > 1 else 1
-                seq_len = importance.size(-1) if importance.dim() > 1 else importance.size(0)
-                if importance.dim() == 1:
-                    routing_probs = torch.ones(seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
-                else:
-                    routing_probs = torch.ones(batch_size, seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
-                return routing_probs
-            else:
-                # For hard routing, assign all to subspace 0
-                return torch.zeros_like(importance, dtype=torch.long)
-
+        # Note: uniform case already handled above
         normalized_importance = (importance - importance_min) / (importance_range + val_epsilon)
 
         if hard:
