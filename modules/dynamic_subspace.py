@@ -867,6 +867,16 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                                    dtype=input_dtype, device=device)
 
         for subspace_id, gamma in enumerate(self.gammas):
+            # NUMERICAL STABILITY: Check if gamma parameter is NaN
+            if torch.isnan(gamma).any() or torch.isinf(gamma).any():
+                print(f"[CRITICAL] Gamma parameter for subspace {subspace_id} is NaN/Inf!")
+                print(f"  This indicates gradient explosion or numerical instability in gamma updates.")
+                print(f"  Resetting gamma to default value.")
+                # Reset to a safe default value based on subspace position
+                default_gamma = (subspace_id + 1) * (self.svd_rank / (self.n_subspaces + 1))
+                with torch.no_grad():
+                    gamma.fill_(default_gamma)
+
             weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)
 
             # DEBUG: Enable detailed NaN tracking for first subspace

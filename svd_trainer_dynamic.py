@@ -555,6 +555,58 @@ def main(args):
 
             return (total_loss, outputs) if return_outputs else total_loss
 
+        def training_step(self, model, inputs):
+            """
+            Override training_step to add gradient clipping for gamma parameters.
+
+            This prevents gamma parameters from becoming NaN due to gradient explosion.
+            """
+            import torch
+
+            model.train()
+            inputs = self._prepare_inputs(inputs)
+
+            # Forward pass
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+
+            # Backward pass
+            if self.args.gradient_accumulation_steps > 1:
+                loss = loss / self.args.gradient_accumulation_steps
+
+            if self.use_apex:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                self.accelerator.backward(loss)
+
+            # NUMERICAL STABILITY: Clip gradients for gamma parameters specifically
+            # This happens AFTER backward but BEFORE optimizer step
+            actual_model = get_actual_model(model)
+            gamma_params = []
+
+            for module in actual_model.modules():
+                if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
+                    if hasattr(module, 'gammas'):
+                        for gamma in module.gammas:
+                            if gamma.grad is not None:
+                                gamma_params.append(gamma)
+
+            if gamma_params:
+                # First check for NaN gradients and zero them out
+                for gamma in gamma_params:
+                    if gamma.grad is not None and (torch.isnan(gamma.grad).any() or torch.isinf(gamma.grad).any()):
+                        print(f"[WARNING] NaN/Inf gradient detected in gamma parameter. Zeroing gradient.")
+                        gamma.grad.zero_()
+
+                # Then clip gamma gradients to prevent explosion
+                # Use a smaller clip value (0.5) for gamma since they're sensitive
+                total_norm = torch.nn.utils.clip_grad_norm_(gamma_params, max_norm=0.5)
+                if total_norm > 0.5:
+                    print(f"[CLIP] Gamma gradient norm {total_norm:.3f} clipped to 0.5")
+
+            return loss.detach()
+
         def create_scheduler(self, num_training_steps, optimizer):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=scheduler_step_size, eta_min=scheduler_min_lr)
             self.lr_scheduler=scheduler
