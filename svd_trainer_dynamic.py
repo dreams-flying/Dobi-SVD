@@ -198,11 +198,24 @@ def main(args):
                 parent = model
             RANK_RATIO = int(min(module.in_features, module.out_features)/SEQ_LEN)
 
+            # CRITICAL: Prevent division by zero
+            if RANK_RATIO == 0:
+                print(f"[WARNING] RANK_RATIO = 0 for layer {name} (in_features={module.in_features}, out_features={module.out_features}, SEQ_LEN={SEQ_LEN})")
+                print(f"  Setting RANK_RATIO = 1 to prevent NaN gamma values")
+                RANK_RATIO = 1
+
             # Calculate base gamma
             if remapping:
                 gamma_base = (1/RANK_RATIO)*target_compression_ratio*min(module.in_features, module.out_features)
             else:
                 gamma_base =(1/RANK_RATIO)*target_compression_ratio*module.in_features*module.out_features/(module.in_features+module.out_features)
+
+            # CRITICAL: Check if gamma_base is valid
+            if not (0 < gamma_base < 10000):  # Sanity check
+                print(f"[ERROR] Invalid gamma_base = {gamma_base} for layer {name}")
+                print(f"  RANK_RATIO={RANK_RATIO}, target_compression_ratio={target_compression_ratio}")
+                print(f"  in_features={module.in_features}, out_features={module.out_features}")
+                raise ValueError(f"Invalid gamma_base computed for layer {name}")
 
             # Initialize multiple gammas for different subspaces
             # Strategy: Use layer-aware initialization for better compression

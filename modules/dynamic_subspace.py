@@ -741,11 +741,22 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # Gamma parameters (trainable)
         # CRITICAL: Must explicitly set requires_grad=True in Parameter constructor!
         # torch.tensor() creates tensors with requires_grad=False by default
+
+        # VALIDATION: Check gamma values before creating parameters
+        for i, g in enumerate(gammas):
+            g_val = g.item() if isinstance(g, torch.Tensor) else g
+            if not (0 < g_val < 10000):  # Sanity check
+                raise ValueError(f"Invalid gamma[{i}] = {g_val}. Gamma must be positive and finite.")
+            if torch.isnan(torch.tensor(g_val)):
+                raise ValueError(f"Gamma[{i}] is NaN! Cannot initialize layer with NaN gamma values.")
+
         self.gammas = nn.ParameterList([
             nn.Parameter(torch.tensor(g, dtype=computeSVD_dtype, device=device),
                         requires_grad=True)
             for g in gammas
         ])
+
+        print(f"[SharedParam] Initialized gammas: {[f'{g.item():.2f}' for g in self.gammas]}")
 
         # ========================================
         # 关键: 只计算一次SVD，所有子空间共享!
@@ -984,6 +995,18 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 2. 应用该子空间的 gamma_k 截断
                 3. 重建: x_k = x @ V^T @ diag(S ⊙ Trunc_k) @ U^T
         """
+        # CRITICAL: Check gamma parameters at the start of forward pass
+        for i, gamma in enumerate(self.gammas):
+            if torch.isnan(gamma).any() or torch.isinf(gamma).any():
+                print(f"[CRITICAL ERROR] Gamma[{i}] is NaN/Inf at START of forward pass!")
+                print(f"  Gamma value: {gamma.item()}")
+                print(f"  This indicates gamma was never properly initialized or was corrupted.")
+                # Reset to safe default
+                default_gamma = float((i + 1) * (self.svd_rank / (self.n_subspaces + 1)))
+                print(f"  Resetting to default: {default_gamma}")
+                with torch.no_grad():
+                    gamma.fill_(default_gamma)
+
         batch_size, seq_len, hidden_size = x.shape
         device = x.device
         input_dtype = x.dtype  # Get input dtype (could be FP16 or FP32)
