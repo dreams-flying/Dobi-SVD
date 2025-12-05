@@ -263,11 +263,28 @@ class TokenRouter(nn.Module):
         Returns:
             routing: Routing assignments [batch, seq_len] (hard) or [batch, seq_len, n_subspaces] (soft)
         """
+        # DEBUG: Check importance at entry
+        has_nan = torch.isnan(importance).any()
+        has_inf = torch.isinf(importance).any()
+        if has_nan or has_inf:
+            print(f"[ERROR] route_tokens called with NaN/Inf importance!")
+            print(f"  NaN count: {torch.isnan(importance).sum()}, Inf count: {torch.isinf(importance).sum()}")
+            print(f"  This should NOT happen - importance should be cleaned before route_tokens")
+            # Clean it here as last resort
+            importance = torch.nan_to_num(importance, nan=0.5, posinf=1.0, neginf=0.0)
+
         # NUMERICAL STABILITY: Handle uniform importance case BEFORE routing
         # This applies to ALL routing strategies (advanced and default)
         importance_min = importance.min()
         importance_max = importance.max()
         importance_range = importance_max - importance_min
+
+        # DEBUG: Print range for first call
+        if not hasattr(self, '_route_debug_count'):
+            self._route_debug_count = 0
+        if self._route_debug_count < 2:
+            print(f"[DEBUG] route_tokens: importance range = {importance_range:.2e}, min={importance_min:.2e}, max={importance_max:.2e}")
+            self._route_debug_count += 1
 
         if importance_range < 1e-10:
             # All importance values are the same (uniform distribution)
