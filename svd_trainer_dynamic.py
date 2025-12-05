@@ -583,6 +583,10 @@ def main(args):
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
 
+            # Ensure loss is scalar (required for backward())
+            if loss.ndim > 0:
+                loss = loss.mean()
+
             # Backward pass
             if self.args.gradient_accumulation_steps > 1:
                 loss = loss / self.args.gradient_accumulation_steps
