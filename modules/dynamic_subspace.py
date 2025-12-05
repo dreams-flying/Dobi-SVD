@@ -919,14 +919,18 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # So x_transformed ≈ x @ V^T @ diag(S) @ U^T
 
         # Compute importance scores for routing
-        # MEMORY OPTIMIZATION: Compute x_approx in-place and free immediately
-        with torch.no_grad():  # Don't need gradients for routing
-            x_approx = x_flat @ V_shared.T
-            x_approx *= S_shared.unsqueeze(0)
-            x_approx = x_approx @ U_shared.T
-            x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
-            importance = self.router.compute_importance(x_for_routing)
-            del x_approx, x_for_routing  # Explicitly free memory
+        # NOTE: importance computation is differentiable to allow:
+        # 1. Temperature scheduling to work properly (gradients flow through softmax)
+        # 2. Routing to adapt based on which tokens benefit from which subspaces
+        # 3. Better gradient signal for gamma parameters
+        x_approx = x_flat @ V_shared.T
+        x_approx = x_approx * S_shared.unsqueeze(0)
+        x_approx = x_approx @ U_shared.T
+        x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
+        importance = self.router.compute_importance(x_for_routing)
+
+        # Note: x_approx will be freed by Python GC automatically
+        # No need for explicit del when not using no_grad()
 
         # Cache for analysis
         if not self.training:
