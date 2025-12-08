@@ -373,16 +373,24 @@ def main(args):
 
         for name, module in model.named_modules():
             if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
-                RANK_RATIO = min(module.ori.in_features, module.ori.out_features) / SEQ_LEN
+                # Get input/output features - different attribute names for different layer types
+                if isinstance(module, SharedParamMultiSubspaceSVDLayer):
+                    in_features = module.input_size
+                    out_features = module.output_size
+                else:
+                    in_features = module.ori.in_features
+                    out_features = module.ori.out_features
+
+                RANK_RATIO = min(in_features, out_features) / SEQ_LEN
 
                 # For multi-subspace, we use the average gamma weighted by routing distribution
                 routing_dist = module.router.get_routing_distribution()
                 avg_gamma = sum(gamma * routing_dist[i].item() for i, gamma in enumerate(module.gammas))
 
                 if remapping:
-                    size_now = max(module.ori.in_features, module.ori.out_features) * avg_gamma * RANK_RATIO
+                    size_now = max(in_features, out_features) * avg_gamma * RANK_RATIO
                 else:
-                    size_now = module.ori.in_features * avg_gamma * RANK_RATIO + module.ori.out_features * avg_gamma * RANK_RATIO
+                    size_now = in_features * avg_gamma * RANK_RATIO + out_features * avg_gamma * RANK_RATIO
 
                 size_ori = module.ori_weight_size
                 size_new = torch.where(size_now < size_ori, size_now, size_ori) + size_new

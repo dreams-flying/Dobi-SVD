@@ -886,14 +886,6 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         print(f"[SharedParam] Parameter reduction: {reduction:.1f}% "
               f"({standard_params:,} → {shared_params:,})")
 
-        # DEBUG: Verify gamma parameters are properly registered
-        print(f"[SharedParam] DEBUG: Number of gammas: {len(self.gammas)}")
-        for i, gamma in enumerate(self.gammas):
-            print(f"[SharedParam] DEBUG: gamma[{i}] type={type(gamma)}, "
-                  f"is_Parameter={isinstance(gamma, nn.Parameter)}, "
-                  f"requires_grad={gamma.requires_grad}, "
-                  f"value={gamma.item():.2f}")
-
     def _forward_impl(self, x, routing_weights):
         """
         Checkpointable computation: Apply multi-subspace SVD with routing.
