@@ -1036,7 +1036,13 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 print(f"  WARNING: ALL outputs are NaN/Inf! This is a critical failure.")
                 print(f"  Check gamma values, routing weights, and input data.")
 
-            output_reshaped = torch.nan_to_num(output_reshaped, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Replace NaN/Inf with safe values
+            # Use ±1000 instead of ±1e4 to keep values in reasonable range
+            output_reshaped = torch.nan_to_num(output_reshaped, nan=0.0, posinf=1000.0, neginf=-1000.0)
+
+        # NUMERICAL STABILITY: Clamp output to prevent extreme activations
+        # This prevents downstream layers from getting unstable inputs
+        output_reshaped = torch.clamp(output_reshaped, min=-1000.0, max=1000.0)
 
         return output_reshaped
 
@@ -1069,7 +1075,7 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # NUMERICAL STABILITY: Check input for NaN/Inf
         if torch.isnan(x).any() or torch.isinf(x).any():
             print(f"[WARNING] NaN/Inf in input to SharedParamMultiSubspaceSVDLayer")
-            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+            x = torch.nan_to_num(x, nan=0.0, posinf=1000.0, neginf=-1000.0)
 
         # Flatten for processing
         x_flat = x.view(-1, hidden_size)  # [batch*seq, hidden]
@@ -1086,7 +1092,9 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             return torch.zeros(batch_size, seq_len, self.output_size, device=device, dtype=input_dtype)
 
         # NUMERICAL STABILITY: Clamp singular values to prevent extreme values
-        S_shared = torch.clamp(S_shared, min=1e-6, max=1e4)
+        # Singular values should be in reasonable range to prevent activation explosion
+        # max=100 instead of 1e4 to keep activations in safe range
+        S_shared = torch.clamp(S_shared, min=1e-6, max=100.0)
 
         # Linear transformation: x_transformed = x @ W^T
         # Where W ≈ U @ diag(S) @ V (SVD approximation)
@@ -1104,7 +1112,7 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             print(f"[ERROR] NaN/Inf after x @ V.T in routing computation")
             print(f"  x_flat range: [{x_flat.min():.2e}, {x_flat.max():.2e}]")
             print(f"  V_shared range: [{V_shared.min():.2e}, {V_shared.max():.2e}]")
-            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1e4, neginf=-1e4)
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1000.0, neginf=-1000.0)
 
         x_approx = x_approx * S_shared.unsqueeze(0)
 
@@ -1112,7 +1120,7 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
             print(f"[ERROR] NaN/Inf after x_approx * S in routing computation")
             print(f"  S_shared range: [{S_shared.min():.2e}, {S_shared.max():.2e}]")
-            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1e4, neginf=-1e4)
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1000.0, neginf=-1000.0)
 
         x_approx = x_approx @ U_shared.T
 
@@ -1120,7 +1128,7 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
             print(f"[ERROR] NaN/Inf after x_approx @ U.T in routing computation")
             print(f"  U_shared range: [{U_shared.min():.2e}, {U_shared.max():.2e}]")
-            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1e4, neginf=-1e4)
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1000.0, neginf=-1000.0)
 
         x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
         importance = self.router.compute_importance(x_for_routing)
