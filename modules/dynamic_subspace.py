@@ -286,7 +286,8 @@ class TokenRouter(nn.Module):
             print(f"[DEBUG] route_tokens: importance range = {importance_range:.2e}, min={importance_min:.2e}, max={importance_max:.2e}")
             self._route_debug_count += 1
 
-        if importance_range < 1e-10:
+        # Use higher threshold to catch floating point precision issues
+        if importance_range < 1e-6:
             # All importance values are the same (uniform distribution)
             # Return uniform routing for soft, or assign all to subspace 0 for hard
             print(f"[INFO] Uniform importance detected (range={importance_range:.2e}). Using uniform routing.")
