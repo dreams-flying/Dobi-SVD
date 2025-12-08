@@ -309,6 +309,22 @@ class TokenRouter(nn.Module):
             else:
                 routing = self.advanced_router.route_soft(importance, temperature=temperature)
 
+            # CRITICAL: Check if advanced router produced NaN
+            if not hard:
+                if torch.isnan(routing).any() or torch.isinf(routing).any():
+                    print(f"[ERROR] Advanced router produced NaN/Inf routing weights!")
+                    print(f"  Router type: {type(self.advanced_router)}")
+                    print(f"  Importance was valid: min={importance.min():.2e}, max={importance.max():.2e}")
+                    print(f"  Routing NaN count: {torch.isnan(routing).sum()}")
+                    print(f"  Falling back to uniform routing")
+                    # Fallback to uniform routing
+                    batch_size = importance.size(0) if importance.dim() > 1 else 1
+                    seq_len = importance.size(-1) if importance.dim() > 1 else importance.size(0)
+                    if importance.dim() == 1:
+                        routing = torch.ones(seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
+                    else:
+                        routing = torch.ones(batch_size, seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
+
             # Update statistics
             if self.training and hard:
                 for i in range(self.n_subspaces):
