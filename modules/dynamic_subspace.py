@@ -904,6 +904,10 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         S_shared = self.S_shared.to(input_dtype)
         U_shared = self.U_shared.to(input_dtype)
 
+        # NUMERICAL STABILITY: Clamp singular values to prevent extreme values
+        # Must match the clamping in forward() to prevent activation explosion
+        S_shared = torch.clamp(S_shared, min=1e-6, max=100.0)
+
         output = None
 
         # IMPORTANT: When gradient checkpointing is enabled, we CANNOT use out= parameter
@@ -947,20 +951,32 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
                 print(f"  gamma_val: {gamma_val.item()}, beta: {self.beta}")
                 print(f"  S_shared range: [{S_shared.min().item():.2e}, {S_shared.max().item():.2e}]")
                 print(f"  trunc range: [{trunc.min().item():.2e}, {trunc.max().item():.2e}]")
-                S_truncated = torch.nan_to_num(S_truncated, nan=1e-6, posinf=1e4, neginf=-1e4)
+                S_truncated = torch.nan_to_num(S_truncated, nan=1e-6, posinf=100.0, neginf=-100.0)
 
             # Reconstruct: choose between buffer reuse (faster) or regular ops (autograd-safe)
             if use_buffer_reuse:
                 # Buffer reuse version: faster but incompatible with gradient checkpointing
                 torch.mm(x_flat, V_shared.T, out=xV_buffer)
+                # Clamp after first matmul to prevent overflow
+                xV_buffer.clamp_(min=-100.0, max=100.0)
                 xV_buffer.mul_(S_truncated.unsqueeze(0))
+                # Clamp after S multiplication
+                xV_buffer.clamp_(min=-100.0, max=100.0)
                 x_sub = xV_buffer @ U_shared.T
+                # Clamp final result to prevent activation explosion
+                x_sub.clamp_(min=-1000.0, max=1000.0)
                 x_sub.mul_(weight)
             else:
                 # Regular version: compatible with gradient checkpointing
                 xV = x_flat @ V_shared.T
+                # Clamp after first matmul to prevent overflow
+                xV = torch.clamp(xV, min=-100.0, max=100.0)
                 xV = xV * S_truncated.unsqueeze(0)
+                # Clamp after S multiplication
+                xV = torch.clamp(xV, min=-100.0, max=100.0)
                 x_sub = xV @ U_shared.T
+                # Clamp final result to prevent activation explosion
+                x_sub = torch.clamp(x_sub, min=-1000.0, max=1000.0)
                 x_sub = x_sub * weight
 
             if output is None:
@@ -1060,28 +1076,35 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # 3. Better gradient signal for gamma parameters
         x_approx = x_flat @ V_shared.T
 
-        # NUMERICAL STABILITY: Check intermediate result
+        # NUMERICAL STABILITY: Check intermediate result and clamp
         if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
             print(f"[ERROR] NaN/Inf after x @ V.T in routing computation")
             print(f"  x_flat range: [{x_flat.min():.2e}, {x_flat.max():.2e}]")
             print(f"  V_shared range: [{V_shared.min():.2e}, {V_shared.max():.2e}]")
-            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1000.0, neginf=-1000.0)
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=100.0, neginf=-100.0)
+        # Aggressive clamping to prevent matrix multiplication overflow
+        x_approx = torch.clamp(x_approx, min=-100.0, max=100.0)
 
         x_approx = x_approx * S_shared.unsqueeze(0)
 
-        # NUMERICAL STABILITY: Check after scaling
+        # NUMERICAL STABILITY: Check after scaling and clamp
         if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
             print(f"[ERROR] NaN/Inf after x_approx * S in routing computation")
             print(f"  S_shared range: [{S_shared.min():.2e}, {S_shared.max():.2e}]")
-            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1000.0, neginf=-1000.0)
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=100.0, neginf=-100.0)
+        # Aggressive clamping after S multiplication (max value = 100 * 100 = 10,000)
+        # Clamp to ±100 to keep next matmul stable
+        x_approx = torch.clamp(x_approx, min=-100.0, max=100.0)
 
         x_approx = x_approx @ U_shared.T
 
-        # NUMERICAL STABILITY: Check final routing input
+        # NUMERICAL STABILITY: Check final routing input and clamp
         if torch.isnan(x_approx).any() or torch.isinf(x_approx).any():
             print(f"[ERROR] NaN/Inf after x_approx @ U.T in routing computation")
             print(f"  U_shared range: [{U_shared.min():.2e}, {U_shared.max():.2e}]")
-            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=1000.0, neginf=-1000.0)
+            x_approx = torch.nan_to_num(x_approx, nan=0.0, posinf=100.0, neginf=-100.0)
+        # Final aggressive clamping before routing to ensure stable importance computation
+        x_approx = torch.clamp(x_approx, min=-100.0, max=100.0)
 
         x_for_routing = x_approx.view(batch_size, seq_len, self.output_size)
         importance = self.router.compute_importance(x_for_routing)
