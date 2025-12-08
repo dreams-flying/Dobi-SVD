@@ -372,7 +372,7 @@ def main(args):
         size_new = torch.tensor(0., device=actual_model.device)
 
         for name, module in model.named_modules():
-            if isinstance(module, MultiSubspaceSVDLayer):
+            if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
                 RANK_RATIO = min(module.ori.in_features, module.ori.out_features) / SEQ_LEN
 
                 # For multi-subspace, we use the average gamma weighted by routing distribution
@@ -397,7 +397,7 @@ def main(args):
         penalty = torch.tensor(0., device=actual_model.device)
 
         for name, module in model.named_modules():
-            if isinstance(module, MultiSubspaceSVDLayer):
+            if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
                 for gamma in module.gammas:
                     lower_penalty = torch.relu(-gamma) ** 2
                     upper_penalty = torch.relu(gamma - torch.tensor(SEQ_LEN, device=gamma.device)) ** 2

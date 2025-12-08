@@ -263,13 +263,12 @@ class TokenRouter(nn.Module):
         Returns:
             routing: Routing assignments [batch, seq_len] (hard) or [batch, seq_len, n_subspaces] (soft)
         """
-        # DEBUG: Check importance at entry
+        # NUMERICAL STABILITY: Check importance at entry
         has_nan = torch.isnan(importance).any()
         has_inf = torch.isinf(importance).any()
         if has_nan or has_inf:
             print(f"[ERROR] route_tokens called with NaN/Inf importance!")
             print(f"  NaN count: {torch.isnan(importance).sum()}, Inf count: {torch.isinf(importance).sum()}")
-            print(f"  This should NOT happen - importance should be cleaned before route_tokens")
             # Clean it here as last resort
             importance = torch.nan_to_num(importance, nan=0.5, posinf=1.0, neginf=0.0)
 
@@ -278,13 +277,6 @@ class TokenRouter(nn.Module):
         importance_min = importance.min()
         importance_max = importance.max()
         importance_range = importance_max - importance_min
-
-        # DEBUG: Print range for first call
-        if not hasattr(self, '_route_debug_count'):
-            self._route_debug_count = 0
-        if self._route_debug_count < 2:
-            print(f"[DEBUG] route_tokens: importance range = {importance_range:.2e}, min={importance_min:.2e}, max={importance_max:.2e}")
-            self._route_debug_count += 1
 
         # Use higher threshold to catch floating point precision issues
         if importance_range < 1e-6:
@@ -945,9 +937,6 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
 
             weight = routing_weights_flat[:, subspace_id].unsqueeze(-1)
 
-            # DEBUG: Enable detailed NaN tracking for first subspace
-            debug_nan = (subspace_id == 0)
-
             # Compute truncation with numerical stability
             sequence = self.sequence_tensor.to(input_dtype)
             gamma_val = gamma.clamp(min=1.0, max=float(self.svd_rank))
@@ -978,37 +967,9 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             else:
                 # Regular version: compatible with gradient checkpointing
                 xV = x_flat @ V_shared.T
-
-                # DEBUG: Check after x @ V
-                if debug_nan and (torch.isnan(xV).any() or torch.isinf(xV).any()):
-                    print(f"[DEBUG] NaN/Inf after x @ V.T")
-                    print(f"  x_flat: NaN={torch.isnan(x_flat).any()}, range=[{x_flat.min():.2e}, {x_flat.max():.2e}]")
-                    print(f"  V_shared: NaN={torch.isnan(V_shared).any()}, range=[{V_shared.min():.2e}, {V_shared.max():.2e}]")
-                    print(f"  xV: NaN count={torch.isnan(xV).sum()}, Inf count={torch.isinf(xV).sum()}")
-
                 xV = xV * S_truncated.unsqueeze(0)
-
-                # DEBUG: Check after * S
-                if debug_nan and (torch.isnan(xV).any() or torch.isinf(xV).any()):
-                    print(f"[DEBUG] NaN/Inf after xV * S_truncated")
-                    print(f"  S_truncated: range=[{S_truncated.min():.2e}, {S_truncated.max():.2e}]")
-                    print(f"  xV: NaN count={torch.isnan(xV).sum()}")
-
                 x_sub = xV @ U_shared.T
-
-                # DEBUG: Check after @ U
-                if debug_nan and (torch.isnan(x_sub).any() or torch.isinf(x_sub).any()):
-                    print(f"[DEBUG] NaN/Inf after xV @ U.T")
-                    print(f"  U_shared: NaN={torch.isnan(U_shared).any()}, range=[{U_shared.min():.2e}, {U_shared.max():.2e}]")
-                    print(f"  x_sub: NaN count={torch.isnan(x_sub).sum()}")
-
                 x_sub = x_sub * weight
-
-                # DEBUG: Check after * weight
-                if debug_nan and (torch.isnan(x_sub).any() or torch.isinf(x_sub).any()):
-                    print(f"[DEBUG] NaN/Inf after x_sub * weight")
-                    print(f"  weight: NaN={torch.isnan(weight).any()}, range=[{weight.min():.2e}, {weight.max():.2e}]")
-                    print(f"  x_sub: NaN count={torch.isnan(x_sub).sum()}")
 
             if output is None:
                 output = x_sub
@@ -1161,19 +1122,6 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
 
             # Convert to model dtype for subsequent layers
             real_x = output.to(model_load_dtype)
-
-            # DEBUG: Check gradient flow
-            if hasattr(self, '_debug_count'):
-                self._debug_count += 1
-            else:
-                self._debug_count = 0
-
-            if self._debug_count < 2:  # Only print first 2 times
-                print(f"[SharedParam] DEBUG Forward:")
-                print(f"  output has grad_fn: {output.grad_fn is not None}")
-                print(f"  real_x has grad_fn: {real_x.grad_fn is not None}")
-                print(f"  routing_weights has grad_fn: {routing_weights.grad_fn is not None}")
-                print(f"  gammas[0] requires_grad: {self.gammas[0].requires_grad}")
 
         else:
             # INFERENCE: Hard routing (discrete assignment)
