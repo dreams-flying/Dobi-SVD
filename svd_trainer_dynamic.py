@@ -500,14 +500,21 @@ def main(args):
 
             # DIAGNOSTIC: Print detailed loss components every 10 steps
             if self.training_step_counter % 10 == 0:
+                # Safe scalar extraction for tensors that might have multiple elements
+                def safe_scalar(tensor):
+                    if tensor.numel() == 1:
+                        return tensor.item()
+                    else:
+                        return tensor.mean().item()
+
                 print(f"\n[LOSS DIAGNOSTIC] Step {self.training_step_counter}:")
-                print(f"  - NLL (task loss):     {loss.item():.4f}")
-                print(f"  - Compression loss:    {reg_loss.item():.4f}  (ratio: {compression_ratio.item():.4f})")
-                print(f"  - Value penalty:       {value_loss.item():.4f}")
-                print(f"  - Balance loss:        {balance_loss.item():.4f}")
-                print(f"  - Gamma reg loss:      {gamma_reg_loss.item() if isinstance(gamma_reg_loss, torch.Tensor) else 0.0:.4f}")
-                print(f"  - TOTAL LOSS:          {total_loss.item():.4f}")
-                print(f"  - Perplexity:          {ppl.item():.2f}")
+                print(f"  - NLL (task loss):     {safe_scalar(loss):.4f}")
+                print(f"  - Compression loss:    {safe_scalar(reg_loss):.4f}  (ratio: {safe_scalar(compression_ratio):.4f})")
+                print(f"  - Value penalty:       {safe_scalar(value_loss):.4f}")
+                print(f"  - Balance loss:        {safe_scalar(balance_loss):.4f}")
+                print(f"  - Gamma reg loss:      {safe_scalar(gamma_reg_loss) if isinstance(gamma_reg_loss, torch.Tensor) else 0.0:.4f}")
+                print(f"  - TOTAL LOSS:          {safe_scalar(total_loss):.4f}")
+                print(f"  - Perplexity:          {safe_scalar(ppl):.2f}")
 
             # Check for NaN/Inf and provide detailed error message
             # Use .any() to handle multi-element tensors
