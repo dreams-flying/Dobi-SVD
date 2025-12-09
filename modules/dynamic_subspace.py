@@ -812,11 +812,11 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # Determine SVD rank (use max gamma + buffer)
         if svd_rank is None:
             max_gamma = max([g if isinstance(g, (int, float)) else g.item() for g in gammas])
-            # FIXED: Use much smaller rank to avoid including tiny singular values
-            # Previous: int(max_gamma) + 10 = 278-286 → includes S values as small as 0.59!
-            # New: Use 40-50% of max_gamma to focus on important singular values
-            # This ensures we keep S values > 2-3, avoiding tiny output variance
-            svd_rank = int(max_gamma * 0.5) + 20  # e.g., 268*0.5+20 = 154
+            # FIXED: Use even smaller rank - S[158]=1.03 still causes gradient vanishing!
+            # Rank 158: S_min=1.03, after gamma truncation → 0.3-0.5 → gradients ~0
+            # Use 30% of max_gamma to ensure minimum S > 2.0
+            # This should give non-vanishing gradients and allow learning
+            svd_rank = int(max_gamma * 0.3) + 20  # e.g., 268*0.3+20 = 100
 
         # Ensure svd_rank doesn't exceed matrix dimensions
         svd_rank = min(svd_rank, min(output_size, input_size))
