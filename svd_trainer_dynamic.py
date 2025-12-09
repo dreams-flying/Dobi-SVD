@@ -498,6 +498,17 @@ def main(args):
 
             total_loss = loss + reg_loss + value_loss + balance_loss + gamma_reg_loss
 
+            # DIAGNOSTIC: Print detailed loss components every 10 steps
+            if self.training_step_counter % 10 == 0:
+                print(f"\n[LOSS DIAGNOSTIC] Step {self.training_step_counter}:")
+                print(f"  - NLL (task loss):     {loss.item():.4f}")
+                print(f"  - Compression loss:    {reg_loss.item():.4f}  (ratio: {compression_ratio.item():.4f})")
+                print(f"  - Value penalty:       {value_loss.item():.4f}")
+                print(f"  - Balance loss:        {balance_loss.item():.4f}")
+                print(f"  - Gamma reg loss:      {gamma_reg_loss.item() if isinstance(gamma_reg_loss, torch.Tensor) else 0.0:.4f}")
+                print(f"  - TOTAL LOSS:          {total_loss.item():.4f}")
+                print(f"  - Perplexity:          {ppl.item():.2f}")
+
             # Check for NaN/Inf and provide detailed error message
             # Use .any() to handle multi-element tensors
             is_nan_or_inf = torch.isnan(total_loss).any() or torch.isinf(total_loss).any()

@@ -874,6 +874,9 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         self.register_buffer('cached_routing', None)
         self.register_buffer('cached_importance', None)
 
+        # DIAGNOSTIC: Forward pass counter for periodic logging
+        self.forward_counter = 0
+
         # OPTIMIZATION: Precompute sequence tensor to avoid recomputation in forward pass
         # This saves significant computation especially for large svd_rank
         sequence_tensor = torch.arange(1, svd_rank + 1, dtype=torch.float32, device=device)
@@ -1185,6 +1188,19 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         # Add bias
         if self.bias is not None:
             real_x = real_x + self.bias
+
+        # DIAGNOSTIC: Print statistics every 100 forward passes (during training only)
+        if self.training:
+            self.forward_counter += 1
+            if self.forward_counter % 100 == 0:
+                print(f"\n[ACTIVATION DIAGNOSTIC] Forward pass {self.forward_counter}:")
+                print(f"  - Output range: [{real_x.min().item():.2e}, {real_x.max().item():.2e}]")
+                print(f"  - Output mean/std: {real_x.mean().item():.2e} / {real_x.std().item():.2e}")
+                print(f"  - Gamma values: {[f'{g.item():.2f}' for g in self.gammas]}")
+                print(f"  - S_shared range: [{self.S_shared.min().item():.2e}, {self.S_shared.max().item():.2e}]")
+                if hasattr(self.router, 'get_routing_distribution'):
+                    routing_dist = self.router.get_routing_distribution()
+                    print(f"  - Routing distribution: {[f'{d:.3f}' for d in routing_dist]}")
 
         return real_x
 
