@@ -1189,11 +1189,13 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         if self.bias is not None:
             real_x = real_x + self.bias
 
-        # DIAGNOSTIC: Print statistics every 100 forward passes (during training only)
+        # DIAGNOSTIC: Print statistics periodically during training
         if self.training:
             self.forward_counter += 1
-            if self.forward_counter % 100 == 0:
-                print(f"\n[ACTIVATION DIAGNOSTIC] Forward pass {self.forward_counter}:")
+            # Print on first pass, then every 10 passes
+            if self.forward_counter == 1 or self.forward_counter % 10 == 0:
+                layer_name = self.name if hasattr(self, 'name') else 'unknown'
+                print(f"\n[ACTIVATION DIAGNOSTIC] Layer: {layer_name}, Forward pass {self.forward_counter}:")
                 print(f"  - Output range: [{real_x.min().item():.2e}, {real_x.max().item():.2e}]")
                 print(f"  - Output mean/std: {real_x.mean().item():.2e} / {real_x.std().item():.2e}")
                 print(f"  - Gamma values: {[f'{g.item():.2f}' for g in self.gammas]}")

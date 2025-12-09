@@ -635,6 +635,22 @@ def main(args):
                             if gamma.grad is not None:
                                 gamma_params.append(gamma)
 
+            # DIAGNOSTIC: Check if gamma parameters have gradients
+            if self.training_step_counter % 10 == 0:
+                gamma_grad_count = len(gamma_params)
+                total_gamma_count = sum(1 for m in actual_model.modules()
+                                       if isinstance(m, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer))
+                                       for _ in m.gammas if hasattr(m, 'gammas'))
+                print(f"\n[GRADIENT DIAGNOSTIC] Step {self.training_step_counter}:")
+                print(f"  - Gamma params with gradients: {gamma_grad_count} / {total_gamma_count}")
+                if gamma_params:
+                    grad_norms = [gamma.grad.norm().item() for gamma in gamma_params[:3]]  # First 3
+                    print(f"  - Sample gamma gradient norms: {[f'{n:.6f}' for n in grad_norms]}")
+                    gamma_values = [gamma.item() for gamma in gamma_params[:3]]  # First 3
+                    print(f"  - Sample gamma values: {[f'{v:.2f}' for v in gamma_values]}")
+                else:
+                    print(f"  - WARNING: NO gamma parameters have gradients!")
+
             if gamma_params:
                 # First check for NaN gradients and zero them out
                 for gamma in gamma_params:
@@ -736,7 +752,35 @@ def main(args):
 
     # train
     print("Starting training...")
+
+    # DIAGNOSTIC: Print initial gamma values and SVD statistics for all layers
+    print("\n" + "="*80)
+    print("INITIAL GAMMA AND SVD STATISTICS")
+    print("="*80)
+    for name, module in model.named_modules():
+        if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
+            print(f"\nLayer: {name}")
+            print(f"  - Gamma values: {[f'{g.item():.2f}' for g in module.gammas]}")
+            if hasattr(module, 'S_shared'):
+                print(f"  - S_shared range: [{module.S_shared.min().item():.2e}, {module.S_shared.max().item():.2e}]")
+                print(f"  - S_shared mean/std: {module.S_shared.mean().item():.2e} / {module.S_shared.std().item():.2e}")
+            if hasattr(module.router, 'get_routing_distribution'):
+                routing_dist = module.router.get_routing_distribution()
+                print(f"  - Initial routing dist: {[f'{d:.3f}' for d in routing_dist]}")
+    print("="*80 + "\n")
+
     trainer.train()
+
+    # DIAGNOSTIC: Print final gamma values to see if they changed
+    print("\n" + "="*80)
+    print("FINAL GAMMA VALUES (check if changed from initial)")
+    print("="*80)
+    for name, module in model.named_modules():
+        if isinstance(module, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer)):
+            print(f"\nLayer: {name}")
+            print(f"  - Gamma values: {[f'{g.item():.2f}' for g in module.gammas]}")
+    print("="*80 + "\n")
+
     print("Training completed!")
 
     # Save final gammas and routing statistics
