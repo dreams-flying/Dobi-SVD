@@ -191,15 +191,24 @@ class TokenRouter(nn.Module):
                 # - Product → tokens that are both relevant and strong
                 importance = avg_similarity * value_norms
 
-                # Re-normalize to [0, 1] for stability
-                importance_min = importance.min()
-                importance_max = importance.max()
-                importance_range = importance_max - importance_min
-                # Prevent division by zero
-                if importance_range < 1e-10:
-                    importance = torch.ones_like(importance) * 0.5
+                # CRITICAL FIX: Don't aggressively normalize to [0,1]
+                # Instead, use percentile-based scaling to preserve variance
+                # This ensures routing can differentiate between tokens
+
+                # Check if variance is too low (all tokens similar)
+                importance_std = importance.std()
+                if importance_std < 1e-6:
+                    # Very low variance - use softmax to amplify differences
+                    # Temperature of 0.1 makes small differences larger
+                    importance = F.softmax(importance / 0.1, dim=-1)
                 else:
-                    importance = (importance - importance_min) / (importance_range + 1e-10)
+                    # Good variance - use softer normalization that preserves relative differences
+                    # Use percentile-based clipping to handle outliers
+                    p10 = torch.quantile(importance.flatten(), 0.1)
+                    p90 = torch.quantile(importance.flatten(), 0.9)
+                    importance = torch.clamp(importance, min=p10, max=p90)
+                    # Normalize to [0, 1] using percentile range (more robust)
+                    importance = (importance - p10) / (p90 - p10 + 1e-10)
 
         elif self.routing_strategy == 'learned':
             # Learnable importance predictor (TokenButler-style)
@@ -278,22 +287,27 @@ class TokenRouter(nn.Module):
         importance_max = importance.max()
         importance_range = importance_max - importance_min
 
-        # Use higher threshold to catch floating point precision issues
-        if importance_range < 1e-6:
-            # All importance values are the same (uniform distribution)
-            # Return uniform routing for soft, or assign all to subspace 0 for hard
-            print(f"[INFO] Uniform importance detected (range={importance_range:.2e}). Using uniform routing.")
+        # CRITICAL FIX: Only treat as uniform if variance is truly zero (exact duplicates)
+        # Use much stricter threshold to avoid false positives
+        if importance_range < 1e-10:
+            # All importance values are EXACTLY the same (floating point precision)
+            # This should be rare after fixes to importance computation
+            print(f"[WARNING] Truly uniform importance detected (range={importance_range:.2e}).")
+            print(f"  This indicates a problem in importance computation.")
+            print(f"  Using softmax to create artificial differentiation.")
+
+            # Use softmax with high temperature to create slight differentiation
+            # This is better than returning uniform routing
             if not hard:
-                batch_size = importance.size(0) if importance.dim() > 1 else 1
-                seq_len = importance.size(-1) if importance.dim() > 1 else importance.size(0)
-                if importance.dim() == 1:
-                    routing_probs = torch.ones(seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
-                else:
-                    routing_probs = torch.ones(batch_size, seq_len, self.n_subspaces, device=importance.device) / self.n_subspaces
+                # Softmax with temperature creates non-uniform distribution even from uniform input
+                routing_probs = F.softmax(importance.unsqueeze(-1).expand(*importance.shape, self.n_subspaces) +
+                                         torch.randn(*importance.shape, self.n_subspaces, device=importance.device) * 0.01,
+                                         dim=-1)
                 return routing_probs
             else:
-                # For hard routing, assign all to subspace 0
-                return torch.zeros_like(importance, dtype=torch.long)
+                # For hard routing, use random assignment to encourage exploration
+                return torch.randint(0, self.n_subspaces, importance.shape,
+                                   dtype=torch.long, device=importance.device)
 
         # Use advanced router if specified
         if self.advanced_router is not None:

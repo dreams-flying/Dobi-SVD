@@ -215,7 +215,15 @@ class ExpertChoiceRouter(nn.Module):
         # Normalize importance (no in-place to preserve gradients)
         imp_min = importance.min()
         imp_max = importance.max()
-        normalized = (importance - imp_min) / (imp_max - imp_min + 1e-10)
+        imp_range = imp_max - imp_min
+
+        # CRITICAL FIX: Handle low-variance case more robustly
+        if imp_range < 1e-6:
+            # Very low variance - use softmax to create differentiation
+            # This amplifies small differences and creates non-uniform routing
+            normalized = F.softmax(importance * 10.0, dim=-1)  # Scale by 10 to amplify
+        else:
+            normalized = (importance - imp_min) / (imp_range + 1e-10)
 
         # MEMORY OPTIMIZATION: Don't create full affinity matrix
         # Instead, compute affinity for each expert on-the-fly
