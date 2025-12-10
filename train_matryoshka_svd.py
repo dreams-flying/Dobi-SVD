@@ -388,6 +388,10 @@ class MatryoshkaSVDTrainer:
                 print(f"  Loss breakdown: {loss_breakdown}")
                 self.print_rank_statistics()
 
+        # CRITICAL: Clear cache at end of epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         avg_loss = total_loss / total_samples
         return avg_loss
 
@@ -397,8 +401,14 @@ class MatryoshkaSVDTrainer:
         total_loss = 0.0
         total_samples = 0
 
+        # CRITICAL: Clear cache before evaluation to free memory from training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
         with torch.no_grad():
-            for batch in tqdm(self.eval_loader, desc="Evaluating"):
+            for batch_idx, batch in enumerate(tqdm(self.eval_loader, desc="Evaluating")):
                 input_ids = batch['input_ids'].to(self.device)
                 labels = input_ids.clone()
 
@@ -410,9 +420,16 @@ class MatryoshkaSVDTrainer:
                 total_loss += loss.item() * input_ids.size(0)
                 total_samples += input_ids.size(0)
 
+                # CRITICAL: Clear cache after each batch to prevent fragmentation
+                if torch.cuda.is_available():
+                    del input_ids, labels, outputs, loss
+                    torch.cuda.empty_cache()
+
         # Clear cache after evaluation
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
         avg_loss = total_loss / total_samples
         perplexity = torch.exp(torch.tensor(avg_loss))
@@ -458,6 +475,12 @@ class MatryoshkaSVDTrainer:
             # Train
             train_loss = self.train_epoch(epoch)
             print(f"\nTrain loss: {train_loss:.4f}")
+
+            # CRITICAL: Clear cache and run garbage collection before evaluation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
 
             # Evaluate
             eval_loss, eval_ppl = self.evaluate()
