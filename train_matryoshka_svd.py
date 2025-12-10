@@ -58,6 +58,14 @@ class MatryoshkaSVDTrainer:
         print(f"  Importance strategy: {args.importance_strategy}")
         print(f"  Multi-scale loss: {args.enable_multiscale_loss}")
         print(f"  Target compression: {args.target_compression:.1%}")
+        print(f"  Gradient accumulation steps: {args.gradient_accumulation_steps}")
+
+        # Memory optimization
+        if torch.cuda.is_available():
+            print(f"\n[Memory Info]")
+            print(f"  GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  Total memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+            torch.cuda.empty_cache()
 
     def prepare_model(self):
         """Load model and apply Matryoshka SVD compression."""
@@ -69,11 +77,20 @@ class MatryoshkaSVDTrainer:
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # MEMORY OPTIMIZATION: Load model with low memory usage
+        print(f"  Loading with low_cpu_mem_usage=True and device_map='auto'")
+
         self.model = AutoModelForCausalLM.from_pretrained(
             self.args.model,
             torch_dtype=torch.float16 if self.args.use_fp16 else torch.float32,
-            device_map='auto' if torch.cuda.is_available() else None
+            device_map='auto' if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True  # CRITICAL for large models
         )
+
+        # Clear cache after loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"  Memory after loading: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
         print(f"Model loaded: {self.model.config.model_type}")
         original_params = sum(p.numel() for p in self.model.parameters())
@@ -287,27 +304,40 @@ class MatryoshkaSVDTrainer:
         return rank_reg_loss * self.args.rank_reg_weight
 
     def train_epoch(self, epoch):
-        """Train for one epoch."""
+        """Train for one epoch with gradient accumulation."""
         self.model.train()
         total_loss = 0.0
         total_samples = 0
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.args.num_epochs}")
 
+        # MEMORY OPTIMIZATION: Gradient accumulation
+        accumulation_steps = self.args.gradient_accumulation_steps
+        self.optimizer.zero_grad()
+
         for batch_idx, batch in enumerate(pbar):
             # Compute loss
             loss, loss_breakdown = self.compute_multiscale_loss(batch)
 
+            # Scale loss by accumulation steps
+            loss = loss / accumulation_steps
+
             # Backward
-            self.optimizer.zero_grad()
             loss.backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+            # Optimizer step every accumulation_steps
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
 
-            # Optimizer step
-            self.optimizer.step()
-            self.scheduler.step()
+                # Optimizer step
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+
+                # Clear cache periodically
+                if torch.cuda.is_available() and (batch_idx + 1) % (accumulation_steps * 10) == 0:
+                    torch.cuda.empty_cache()
 
             # Logging
             total_loss += loss.item() * batch['input_ids'].size(0)
@@ -481,7 +511,9 @@ def parse_args():
     parser.add_argument('--rank_reg_weight', type=float, default=0.001,
                        help='Rank regularization weight')
     parser.add_argument('--batch_size', type=int, default=1,
-                       help='Batch size')
+                       help='Batch size per GPU')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=4,
+                       help='Gradient accumulation steps (effective batch size = batch_size * accumulation)')
     parser.add_argument('--seq_len', type=int, default=2048,
                        help='Sequence length')
     parser.add_argument('--num_epochs', type=int, default=3,

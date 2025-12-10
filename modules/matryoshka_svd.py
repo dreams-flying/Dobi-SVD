@@ -211,35 +211,69 @@ class MatryoshkaSVDLayer(nn.Module):
 
         # Compute SVD decomposition ONCE
         print(f"[{self.name}] Computing SVD decomposition with rank={r_max}...")
+        print(f"  - Matrix size: {output_size} x {input_size}")
+        print(f"  - Memory-optimized: Computing on CPU to save GPU memory")
 
         with torch.no_grad():
-            # Move to float32 for SVD stability
-            weight_svd = weight.to(torch.float32)
+            # MEMORY OPTIMIZATION: Compute SVD on CPU to avoid GPU OOM
+            # Move weight to CPU and float32 for SVD stability
+            weight_cpu = weight.cpu().to(torch.float32)
+
+            # Clear GPU cache before SVD
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             try:
-                # Full SVD then truncate (more stable than randomized SVD for small ranks)
-                U, S, Vh = torch.linalg.svd(weight_svd, full_matrices=False)
+                # STRATEGY: Use randomized SVD for large matrices (faster and more memory efficient)
+                # For matrices larger than 2048x2048, use randomized SVD
+                use_randomized = (output_size * input_size > 2048 * 2048)
 
-                # Truncate to r_max
-                U = U[:, :r_max]   # [output_size, r_max]
-                S = S[:r_max]      # [r_max]
-                V = Vh[:r_max, :]  # [r_max, input_size]
+                if use_randomized and r_max < min(output_size, input_size) // 2:
+                    print(f"  - Using randomized SVD (faster for large matrices)")
+                    # Randomized SVD using power iteration
+                    # This is much more memory efficient than full SVD
+                    U, S, V = self._randomized_svd(weight_cpu, r_max)
+                else:
+                    print(f"  - Using standard SVD on CPU")
+                    # Full SVD then truncate (more stable than randomized SVD for small ranks)
+                    U, S, Vh = torch.linalg.svd(weight_cpu, full_matrices=False)
 
-                # Compute reconstruction error
-                weight_reconstructed = U @ torch.diag(S) @ V
-                reconstruction_error = (weight_svd - weight_reconstructed).norm() / weight_svd.norm()
+                    # Truncate to r_max
+                    U = U[:, :r_max]   # [output_size, r_max]
+                    S = S[:r_max]      # [r_max]
+                    V = Vh[:r_max, :]  # [r_max, input_size]
+
+                # Free CPU memory
+                del weight_cpu
+
+                # Compute reconstruction error (on CPU to save GPU memory)
+                with torch.no_grad():
+                    sample_size = min(1000, output_size)  # Use sample for large matrices
+                    U_sample = U[:sample_size, :]
+                    V_sample = V[:, :sample_size]
+                    weight_sample = weight[:sample_size, :sample_size].cpu().to(torch.float32)
+
+                    weight_reconstructed_sample = U_sample @ torch.diag(S) @ V_sample
+                    reconstruction_error = (weight_sample - weight_reconstructed_sample).norm() / (weight_sample.norm() + 1e-8)
+
+                    del U_sample, V_sample, weight_sample, weight_reconstructed_sample
 
                 print(f"[{self.name}] SVD complete:")
                 print(f"  - U shape: {U.shape}")
                 print(f"  - S shape: {S.shape}, range: [{S.min():.4f}, {S.max():.4f}]")
                 print(f"  - V shape: {V.shape}")
-                print(f"  - Reconstruction error: {reconstruction_error.item():.6f}")
+                print(f"  - Reconstruction error (sampled): {reconstruction_error.item():.6f}")
 
             except Exception as e:
                 print(f"[{self.name}] SVD failed ({e}), using random initialization")
-                U = torch.randn(output_size, r_max, dtype=torch.float32, device=self.device) * 0.01
-                S = torch.ones(r_max, dtype=torch.float32, device=self.device)
-                V = torch.randn(r_max, input_size, dtype=torch.float32, device=self.device) * 0.01
+                # Initialize on CPU first
+                U = torch.randn(output_size, r_max, dtype=torch.float32) * 0.01
+                S = torch.ones(r_max, dtype=torch.float32)
+                V = torch.randn(r_max, input_size, dtype=torch.float32) * 0.01
+
+            # Clear cache again before moving to GPU
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Register as buffers (non-trainable)
         self.register_buffer('U', U.to(self.device))
@@ -268,6 +302,53 @@ class MatryoshkaSVDLayer(nn.Module):
 
         # Multi-scale loss outputs (for training)
         self.multiscale_outputs = {}
+
+    @staticmethod
+    def _randomized_svd(matrix, rank, n_oversamples=10, n_iter=2):
+        """
+        Compute randomized SVD using power iteration.
+
+        More memory efficient than full SVD for large matrices.
+        Based on: "Finding structure with randomness" (Halko et al., 2011)
+
+        Args:
+            matrix: Input matrix [m, n]
+            rank: Target rank
+            n_oversamples: Additional samples for accuracy
+            n_iter: Number of power iterations
+
+        Returns:
+            U, S, V: SVD components
+        """
+        m, n = matrix.shape
+        r = min(rank + n_oversamples, min(m, n))
+
+        # Random projection
+        Omega = torch.randn(n, r, dtype=matrix.dtype, device=matrix.device)
+
+        # Power iteration for better accuracy
+        Y = matrix @ Omega
+        for _ in range(n_iter):
+            Y = matrix @ (matrix.T @ Y)
+
+        # QR decomposition
+        Q, _ = torch.linalg.qr(Y)
+
+        # Project matrix
+        B = Q.T @ matrix
+
+        # SVD of small matrix
+        U_tilde, S, Vh = torch.linalg.svd(B, full_matrices=False)
+
+        # Recover U
+        U = Q @ U_tilde
+
+        # Truncate to desired rank
+        U = U[:, :rank]
+        S = S[:rank]
+        V = Vh[:rank, :]
+
+        return U, S, V
 
     def compute_soft_truncation(self, adaptive_rank: torch.Tensor) -> torch.Tensor:
         """
