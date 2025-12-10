@@ -829,35 +829,14 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
             # Move to appropriate dtype for SVD
             weight_svd = weight.to(computeSVD_dtype)
 
-            # DIAGNOSTIC: Print weight statistics BEFORE SVD
-            print(f"\n[SVD DIAGNOSTIC] Layer {name}:")
-            print(f"  - Weight shape: {weight_svd.shape}")
-            print(f"  - Weight range: [{weight_svd.min().item():.6f}, {weight_svd.max().item():.6f}]")
-            print(f"  - Weight mean/std: {weight_svd.mean().item():.6f} / {weight_svd.std().item():.6f}")
-            print(f"  - Weight norm: {weight_svd.norm().item():.2f}")
-            print(f"  - SVD rank to compute: {svd_rank}")
-
             # Compute low-rank SVD
             try:
                 U, S, Vh = torch.linalg.svd(weight_svd, full_matrices=False)
-
-                # DIAGNOSTIC: Print singular value statistics BEFORE truncation
-                print(f"  - Full S range: [{S.min().item():.6f}, {S.max().item():.6f}]")
-                print(f"  - Full S mean/std: {S.mean().item():.6f} / {S.std().item():.6f}")
-                print(f"  - Top 5 singular values: {S[:5].tolist()}")
-                print(f"  - S values at rank {svd_rank}: {S[svd_rank-5:svd_rank].tolist() if svd_rank >= 5 else S[:svd_rank].tolist()}")
 
                 # Truncate to desired rank
                 U = U[:, :svd_rank]   # [output_size, svd_rank]
                 S = S[:svd_rank]       # [svd_rank]
                 V = Vh[:svd_rank, :]   # [svd_rank, input_size]
-
-                # DIAGNOSTIC: Compute reconstruction error
-                weight_reconstructed = U @ torch.diag(S) @ V
-                reconstruction_error = (weight_svd - weight_reconstructed).norm() / weight_svd.norm()
-                print(f"  - Truncated S range: [{S.min().item():.6f}, {S.max().item():.6f}]")
-                print(f"  - Reconstruction error: {reconstruction_error.item():.6f}")
-                print(f"[SharedParam] SVD shapes: U={U.shape}, S={S.shape}, V={V.shape}")
 
             except Exception as e:
                 print(f"[SharedParam] Warning: SVD failed ({e}), using random initialization")
@@ -1212,11 +1191,11 @@ class SharedParamMultiSubspaceSVDLayer(nn.Module):
         if self.bias is not None:
             real_x = real_x + self.bias
 
-        # DIAGNOSTIC: Print statistics periodically during training
+        # DIAGNOSTIC: Print statistics periodically during training (reduced frequency to save memory)
         if self.training:
             self.forward_counter += 1
-            # Print on first pass, then every 10 passes
-            if self.forward_counter == 1 or self.forward_counter % 10 == 0:
+            # Print on first pass, then every 500 passes (reduced from 10 to avoid OOM)
+            if self.forward_counter == 1 or self.forward_counter % 500 == 0:
                 layer_name = self.name if hasattr(self, 'name') else 'unknown'
                 print(f"\n[ACTIVATION DIAGNOSTIC] Layer: {layer_name}, Forward pass {self.forward_counter}:")
                 print(f"  - Output range: [{real_x.min().item():.2e}, {real_x.max().item():.2e}]")

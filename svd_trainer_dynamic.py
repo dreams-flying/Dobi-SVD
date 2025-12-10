@@ -498,8 +498,8 @@ def main(args):
 
             total_loss = loss + reg_loss + value_loss + balance_loss + gamma_reg_loss
 
-            # DIAGNOSTIC: Print detailed loss components every 10 steps
-            if self.training_step_counter % 10 == 0:
+            # DIAGNOSTIC: Print detailed loss components every 100 steps (reduced from 10 to save memory)
+            if self.training_step_counter % 100 == 0:
                 # Safe scalar extraction for tensors that might have multiple elements
                 def safe_scalar(tensor):
                     if tensor.numel() == 1:
@@ -635,8 +635,8 @@ def main(args):
                             if gamma.grad is not None:
                                 gamma_params.append(gamma)
 
-            # DIAGNOSTIC: Check if gamma parameters have gradients
-            if self.training_step_counter % 10 == 0:
+            # DIAGNOSTIC: Check if gamma parameters have gradients every 50 steps (reduced from 10)
+            if self.training_step_counter % 50 == 0:
                 gamma_grad_count = len(gamma_params)
                 total_gamma_count = sum(1 for m in actual_model.modules()
                                        if isinstance(m, (MultiSubspaceSVDLayer, SharedParamMultiSubspaceSVDLayer))
