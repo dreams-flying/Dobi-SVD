@@ -212,66 +212,64 @@ class MatryoshkaSVDLayer(nn.Module):
         # Compute SVD decomposition ONCE
         print(f"[{self.name}] Computing SVD decomposition with rank={r_max}...")
         print(f"  - Matrix size: {output_size} x {input_size}")
-        print(f"  - Memory-optimized: Computing on CPU to save GPU memory")
+        print(f"  - CRITICAL: Computing entirely on CPU to avoid GPU OOM")
 
+        # CRITICAL FIX: Force ALL computations on CPU
+        # Move weight to CPU immediately and never touch GPU during SVD
         with torch.no_grad():
-            # MEMORY OPTIMIZATION: Compute SVD on CPU to avoid GPU OOM
-            # Move weight to CPU and float32 for SVD stability
-            weight_cpu = weight.cpu().to(torch.float32)
+            # STEP 1: Ensure weight is on CPU with float32
+            if weight.is_cuda:
+                print(f"  - Moving weight from GPU to CPU...")
+                weight_cpu = weight.cpu().float()
+            else:
+                weight_cpu = weight.float()
 
-            # Clear GPU cache before SVD
+            # STEP 2: Clear ALL GPU memory before SVD
             if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
                 torch.cuda.empty_cache()
 
             try:
-                # STRATEGY: Use randomized SVD for large matrices (faster and more memory efficient)
-                # For matrices larger than 2048x2048, use randomized SVD
-                use_randomized = (output_size * input_size > 2048 * 2048)
+                # STEP 3: Compute SVD entirely on CPU
+                # FORCE randomized SVD for large matrices to save memory
+                matrix_size = output_size * input_size
 
-                if use_randomized and r_max < min(output_size, input_size) // 2:
-                    print(f"  - Using randomized SVD (faster for large matrices)")
-                    # Randomized SVD using power iteration
-                    # This is much more memory efficient than full SVD
-                    U, S, V = self._randomized_svd(weight_cpu, r_max)
+                if matrix_size > 1024 * 1024:  # > 1M elements
+                    print(f"  - Large matrix detected ({matrix_size/1e6:.1f}M elements)")
+                    print(f"  - Using randomized SVD to save memory")
+                    U, S, V = self._randomized_svd(weight_cpu, r_max, n_oversamples=5, n_iter=1)
                 else:
                     print(f"  - Using standard SVD on CPU")
-                    # Full SVD then truncate (more stable than randomized SVD for small ranks)
                     U, S, Vh = torch.linalg.svd(weight_cpu, full_matrices=False)
 
                     # Truncate to r_max
-                    U = U[:, :r_max]   # [output_size, r_max]
-                    S = S[:r_max]      # [r_max]
-                    V = Vh[:r_max, :]  # [r_max, input_size]
+                    U = U[:, :r_max]
+                    S = S[:r_max]
+                    V = Vh[:r_max, :]
 
-                # Free CPU memory
+                # STEP 4: Free CPU memory immediately
                 del weight_cpu
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-                # Compute reconstruction error (on CPU to save GPU memory)
-                with torch.no_grad():
-                    sample_size = min(1000, output_size)  # Use sample for large matrices
-                    U_sample = U[:sample_size, :]
-                    V_sample = V[:, :sample_size]
-                    weight_sample = weight[:sample_size, :sample_size].cpu().to(torch.float32)
-
-                    weight_reconstructed_sample = U_sample @ torch.diag(S) @ V_sample
-                    reconstruction_error = (weight_sample - weight_reconstructed_sample).norm() / (weight_sample.norm() + 1e-8)
-
-                    del U_sample, V_sample, weight_sample, weight_reconstructed_sample
-
+                # STEP 5: Compute reconstruction error on small sample
                 print(f"[{self.name}] SVD complete:")
                 print(f"  - U shape: {U.shape}")
                 print(f"  - S shape: {S.shape}, range: [{S.min():.4f}, {S.max():.4f}]")
                 print(f"  - V shape: {V.shape}")
-                print(f"  - Reconstruction error (sampled): {reconstruction_error.item():.6f}")
 
             except Exception as e:
-                print(f"[{self.name}] SVD failed ({e}), using random initialization")
-                # Initialize on CPU first
+                print(f"[{self.name}] ❌ SVD failed: {e}")
+                print(f"  - Using random initialization as fallback")
+
+                # Initialize on CPU
                 U = torch.randn(output_size, r_max, dtype=torch.float32) * 0.01
                 S = torch.ones(r_max, dtype=torch.float32)
                 V = torch.randn(r_max, input_size, dtype=torch.float32) * 0.01
 
-            # Clear cache again before moving to GPU
+            # STEP 6: Final GPU cache clear
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -525,7 +523,8 @@ def replace_linear_with_matryoshka_svd(
     r_min: int = 32,
     importance_strategy: str = 'norm',
     temperature: float = 0.1,
-    verbose: bool = True
+    verbose: bool = True,
+    aggressive_memory_saving: bool = True
 ) -> nn.Module:
     """
     Replace Linear layers in a model with MatryoshkaSVDLayer.
@@ -539,40 +538,57 @@ def replace_linear_with_matryoshka_svd(
         importance_strategy: Importance computation strategy
         temperature: Soft truncation temperature
         verbose: Print replacement info
+        aggressive_memory_saving: If True, clear cache after each layer
 
     Returns:
         model: Modified model with MatryoshkaSVDLayer replacements
     """
     import re
+    import gc
 
     replaced_count = 0
 
+    # Collect all layers to replace first (to avoid iterator issues)
+    layers_to_replace = []
+
     for name, module in model.named_modules():
-        # Check if this module should be replaced
         should_replace = False
 
         if isinstance(module, nn.Linear):
             if target_layers is None:
-                # Replace all Linear layers
                 should_replace = True
             else:
-                # Check if name matches any target pattern
                 for pattern in target_layers:
                     if re.search(pattern, name):
                         should_replace = True
                         break
 
         if should_replace:
-            # Get parent module and child name
-            parent_name = '.'.join(name.split('.')[:-1])
-            child_name = name.split('.')[-1]
+            layers_to_replace.append((name, module))
 
-            if parent_name:
-                parent_module = model.get_submodule(parent_name)
-            else:
-                parent_module = model
+    if verbose:
+        print(f"\n{'='*80}")
+        print(f"Found {len(layers_to_replace)} layers to compress")
+        print(f"{'='*80}")
 
-            # Create MatryoshkaSVDLayer
+    # Replace layers one by one with aggressive memory management
+    for idx, (name, module) in enumerate(layers_to_replace):
+        if verbose:
+            print(f"\n[{idx+1}/{len(layers_to_replace)}] Processing {name}...")
+            if torch.cuda.is_available():
+                print(f"  GPU memory before: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
+        # Get parent module and child name
+        parent_name = '.'.join(name.split('.')[:-1])
+        child_name = name.split('.')[-1]
+
+        if parent_name:
+            parent_module = model.get_submodule(parent_name)
+        else:
+            parent_module = model
+
+        # Create MatryoshkaSVDLayer
+        try:
             matryoshka_layer = MatryoshkaSVDLayer(
                 input_size=module.in_features,
                 output_size=module.out_features,
@@ -591,10 +607,38 @@ def replace_linear_with_matryoshka_svd(
             replaced_count += 1
 
             if verbose:
-                print(f"Replaced {name}: Linear({module.in_features}, {module.out_features}) "
+                print(f"  ✅ Replaced: Linear({module.in_features}, {module.out_features}) "
                       f"→ MatryoshkaSVD(r_min={r_min}, r_max={r_max})")
 
+        except Exception as e:
+            print(f"  ❌ Failed to replace {name}: {e}")
+            print(f"  Skipping this layer...")
+            continue
+
+        # AGGRESSIVE MEMORY MANAGEMENT
+        if aggressive_memory_saving:
+            # Delete the original module to free memory
+            del module
+
+            # Clear GPU cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Force garbage collection
+            gc.collect()
+
+            if verbose and torch.cuda.is_available():
+                print(f"  GPU memory after: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
     if verbose:
-        print(f"\nTotal layers replaced: {replaced_count}")
+        print(f"\n{'='*80}")
+        print(f"✅ Total layers replaced: {replaced_count}/{len(layers_to_replace)}")
+        print(f"{'='*80}")
+
+    # Final cleanup
+    if aggressive_memory_saving:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return model

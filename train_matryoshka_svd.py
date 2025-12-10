@@ -103,6 +103,12 @@ class MatryoshkaSVDTrainer:
         # Replace target layers with Matryoshka SVD
         target_layers = self.args.target_layers.split(',') if self.args.target_layers else None
 
+        # MEMORY CRITICAL: Use aggressive memory saving mode
+        print(f"\n⚠️  MEMORY OPTIMIZATION MODE: Aggressive")
+        print(f"  - Processing layers one by one")
+        print(f"  - Clearing GPU cache after each layer")
+        print(f"  - Using CPU for all SVD computations")
+
         self.model = replace_linear_with_matryoshka_svd(
             self.model,
             target_layers=target_layers,
@@ -110,7 +116,8 @@ class MatryoshkaSVDTrainer:
             r_min=self.args.r_min,
             importance_strategy=self.args.importance_strategy,
             temperature=self.args.temperature,
-            verbose=True
+            verbose=True,
+            aggressive_memory_saving=True  # CRITICAL for low memory
         )
 
         compressed_params = sum(p.numel() for p in self.model.parameters())
@@ -491,10 +498,10 @@ def parse_args():
                        choices=['wikitext', 'c4'], help='Dataset name')
 
     # Matryoshka SVD arguments
-    parser.add_argument('--r_max', type=int, default=256,
-                       help='Maximum rank')
-    parser.add_argument('--r_min', type=int, default=32,
-                       help='Minimum rank')
+    parser.add_argument('--r_max', type=int, default=128,
+                       help='Maximum rank (default: 128, use 64 for 40GB GPU, 256 for 80GB GPU)')
+    parser.add_argument('--r_min', type=int, default=16,
+                       help='Minimum rank (default: 16, typically r_max/8 to r_max/4)')
     parser.add_argument('--importance_strategy', type=str, default='norm',
                        choices=['norm', 'learned', 'attention'],
                        help='Importance computation strategy')
