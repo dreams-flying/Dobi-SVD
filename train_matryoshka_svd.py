@@ -8,16 +8,21 @@ featuring:
 3. Adaptive rank selection (no routing overhead)
 
 Usage:
+    # Memory-optimized (80GB GPU):
     python train_matryoshka_svd.py \
         --model meta-llama/Llama-2-7b-hf \
         --dataset wikitext2 \
-        --r_max 256 \
-        --r_min 32 \
+        --r_max 64 \
+        --r_min 16 \
         --target_compression 0.15 \
         --importance_strategy learned \
         --enable_multiscale_loss \
-        --n_train_samples 256 \
-        --n_eval_samples 256
+        --n_train_samples 128 \
+        --n_eval_samples 128 \
+        --batch_size 1 \
+        --gradient_accumulation_steps 8 \
+        --seq_len 512 \
+        --use_fp16
 
 Author: Claude (Anthropic)
 Date: 2025-12-10
@@ -128,6 +133,16 @@ class MatryoshkaSVDTrainer:
         print(f"Compression ratio: {compressed_params/original_params:.1%}")
         print(f"Reduction: {(1 - compressed_params/original_params):.1%}")
 
+        # CRITICAL: Enable gradient checkpointing to save memory
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            print("\n⚠️  Enabling gradient checkpointing to save memory")
+            self.model.gradient_checkpointing_enable()
+
+        # Clear cache after compression
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"  Memory after compression: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
         # Move to device if not using device_map
         if not torch.cuda.is_available() or self.args.no_device_map:
             self.model = self.model.to(self.device)
@@ -157,18 +172,21 @@ class MatryoshkaSVDTrainer:
         )
 
         # Create dataloaders from tokenized data
+        # CRITICAL: Use num_workers=0 to avoid forking issues and memory duplication
         self.train_loader = DataLoader(
             tokenized_traindata,
             batch_size=self.args.batch_size,
             shuffle=True,
-            num_workers=self.args.num_workers
+            num_workers=0,  # Avoid forking issues
+            pin_memory=True if torch.cuda.is_available() else False
         )
 
         self.eval_loader = DataLoader(
             tokenized_valdata,
             batch_size=self.args.batch_size,
             shuffle=False,
-            num_workers=self.args.num_workers
+            num_workers=0,  # Avoid forking issues
+            pin_memory=True if torch.cuda.is_available() else False
         )
 
         print(f"Train samples: {len(tokenized_traindata)}")
@@ -235,6 +253,15 @@ class MatryoshkaSVDTrainer:
         print(f"Total training steps: {total_steps}")
         print(f"Warmup steps: {warmup_steps}")
 
+        # CRITICAL: Setup mixed precision training with GradScaler
+        if self.args.use_fp16 and torch.cuda.is_available():
+            print(f"\n⚠️  Enabling mixed precision training (FP16)")
+            self.scaler = torch.cuda.amp.GradScaler()
+            self.use_amp = True
+        else:
+            self.scaler = None
+            self.use_amp = False
+
     def compute_multiscale_loss(self, batch):
         """
         Compute multi-scale training loss across different rank levels.
@@ -245,31 +272,33 @@ class MatryoshkaSVDTrainer:
         input_ids = batch['input_ids'].to(self.device)
         labels = input_ids.clone()
 
-        # Forward pass (main loss with adaptive ranks)
-        outputs = self.model(input_ids=input_ids, labels=labels)
-        main_loss = outputs.loss
+        # CRITICAL: Use autocast for mixed precision
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            # Forward pass (main loss with adaptive ranks)
+            outputs = self.model(input_ids=input_ids, labels=labels)
+            main_loss = outputs.loss
 
-        if not self.args.enable_multiscale_loss:
-            return main_loss, {'main': main_loss.item()}
+            if not self.args.enable_multiscale_loss:
+                return main_loss, {'main': main_loss.item()}
 
-        # Collect multi-scale losses
-        multiscale_losses = []
-        loss_breakdown = {'main': main_loss.item()}
+            # Collect multi-scale losses
+            multiscale_losses = []
+            loss_breakdown = {'main': main_loss.item()}
 
-        # Iterate through Matryoshka layers and collect multi-scale outputs
-        for name, module in self.model.named_modules():
-            if isinstance(module, MatryoshkaSVDLayer):
-                if hasattr(module, 'multiscale_outputs') and module.multiscale_outputs:
-                    # This would require hooking into the model's forward pass
-                    # For simplicity, we'll use rank regularization instead
-                    pass
+            # Iterate through Matryoshka layers and collect multi-scale outputs
+            for name, module in self.model.named_modules():
+                if isinstance(module, MatryoshkaSVDLayer):
+                    if hasattr(module, 'multiscale_outputs') and module.multiscale_outputs:
+                        # This would require hooking into the model's forward pass
+                        # For simplicity, we'll use rank regularization instead
+                        pass
 
-        # For now, use rank regularization as a proxy for multi-scale loss
-        rank_reg_loss = self.compute_rank_regularization()
-        loss_breakdown['rank_reg'] = rank_reg_loss.item()
+            # For now, use rank regularization as a proxy for multi-scale loss
+            rank_reg_loss = self.compute_rank_regularization()
+            loss_breakdown['rank_reg'] = rank_reg_loss.item()
 
-        # Total loss
-        total_loss = main_loss + rank_reg_loss
+            # Total loss
+            total_loss = main_loss + rank_reg_loss
 
         return total_loss, loss_breakdown
 
@@ -307,21 +336,33 @@ class MatryoshkaSVDTrainer:
             # Scale loss by accumulation steps
             loss = loss / accumulation_steps
 
-            # Backward
-            loss.backward()
+            # CRITICAL: Backward with mixed precision
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             # Optimizer step every accumulation_steps
             if (batch_idx + 1) % accumulation_steps == 0:
+                if self.scaler is not None:
+                    # Unscale gradients for clipping
+                    self.scaler.unscale_(self.optimizer)
+
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
 
-                # Optimizer step
-                self.optimizer.step()
+                # Optimizer step with scaler
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+
                 self.scheduler.step()
                 self.optimizer.zero_grad()
 
-                # Clear cache periodically
-                if torch.cuda.is_available() and (batch_idx + 1) % (accumulation_steps * 10) == 0:
+                # CRITICAL: Clear cache more aggressively
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
             # Logging
@@ -354,11 +395,17 @@ class MatryoshkaSVDTrainer:
                 input_ids = batch['input_ids'].to(self.device)
                 labels = input_ids.clone()
 
-                outputs = self.model(input_ids=input_ids, labels=labels)
-                loss = outputs.loss
+                # Use autocast for evaluation too
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    outputs = self.model(input_ids=input_ids, labels=labels)
+                    loss = outputs.loss
 
                 total_loss += loss.item() * input_ids.size(0)
                 total_samples += input_ids.size(0)
+
+        # Clear cache after evaluation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         avg_loss = total_loss / total_samples
         perplexity = torch.exp(torch.tensor(avg_loss))
@@ -476,8 +523,8 @@ def parse_args():
                        choices=['wikitext2', 'c4', 'ptb'], help='Dataset name')
 
     # Matryoshka SVD arguments
-    parser.add_argument('--r_max', type=int, default=128,
-                       help='Maximum rank (default: 128, use 64 for 40GB GPU, 256 for 80GB GPU)')
+    parser.add_argument('--r_max', type=int, default=64,
+                       help='Maximum rank (default: 64 for memory efficiency, use 128 for 80GB GPU, 256 for A100)')
     parser.add_argument('--r_min', type=int, default=16,
                        help='Minimum rank (default: 16, typically r_max/8 to r_max/4)')
     parser.add_argument('--importance_strategy', type=str, default='norm',
@@ -496,11 +543,11 @@ def parse_args():
     parser.add_argument('--rank_reg_weight', type=float, default=0.001,
                        help='Rank regularization weight')
     parser.add_argument('--batch_size', type=int, default=1,
-                       help='Batch size per GPU')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=4,
-                       help='Gradient accumulation steps (effective batch size = batch_size * accumulation)')
-    parser.add_argument('--seq_len', type=int, default=2048,
-                       help='Sequence length')
+                       help='Batch size per GPU (keep at 1 for memory efficiency)')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=8,
+                       help='Gradient accumulation steps (effective batch size = batch_size * accumulation). Higher value = less memory')
+    parser.add_argument('--seq_len', type=int, default=512,
+                       help='Sequence length (lower = less memory)')
     parser.add_argument('--num_epochs', type=int, default=3,
                        help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
@@ -539,10 +586,10 @@ def parse_args():
                        help='Logging interval (steps)')
     parser.add_argument('--save_interval', type=int, default=1,
                        help='Save interval (epochs)')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of data loading workers')
-    parser.add_argument('--use_fp16', action='store_true',
-                       help='Use FP16 training')
+    parser.add_argument('--num_workers', type=int, default=0,
+                       help='Number of data loading workers (0 to avoid forking issues)')
+    parser.add_argument('--use_fp16', action='store_true', default=True,
+                       help='Use FP16 mixed precision training (enabled by default for memory efficiency)')
     parser.add_argument('--no_device_map', action='store_true',
                        help='Disable automatic device mapping')
 
