@@ -10,12 +10,14 @@ featuring:
 Usage:
     python train_matryoshka_svd.py \
         --model meta-llama/Llama-2-7b-hf \
-        --dataset wikitext \
+        --dataset wikitext2 \
         --r_max 256 \
         --r_min 32 \
         --target_compression 0.15 \
         --importance_strategy learned \
-        --enable_multiscale_loss
+        --enable_multiscale_loss \
+        --n_train_samples 256 \
+        --n_eval_samples 256
 
 Author: Claude (Anthropic)
 Date: 2025-12-10
@@ -42,6 +44,7 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).parent))
 
 from modules.matryoshka_svd import MatryoshkaSVDLayer, replace_linear_with_matryoshka_svd
+from utils.datautils import prepare_train_loaders
 
 
 class MatryoshkaSVDTrainer:
@@ -137,64 +140,39 @@ class MatryoshkaSVDTrainer:
         print("STEP 3: Preparing datasets")
         print("="*80)
 
-        # Load dataset
-        if self.args.dataset == 'wikitext':
-            dataset = load_dataset('wikitext', 'wikitext-2-raw-v1')
-            train_data = dataset['train']
-            eval_data = dataset['validation']
-        elif self.args.dataset == 'c4':
-            dataset = load_dataset('c4', 'en', streaming=True)
-            train_data = dataset['train']
-            eval_data = dataset['validation']
-        else:
-            raise ValueError(f"Unknown dataset: {self.args.dataset}")
+        # Setup paths for caching
+        path_head_folder = Path(self.args.path_head_folder)
+        data_cache_dir = path_head_folder / "data_cache"
+        dataset_cache_dir = path_head_folder / "dataset_cache"
+        data_cache_dir.mkdir(parents=True, exist_ok=True)
+        dataset_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Tokenize
-        def tokenize_function(examples):
-            return self.tokenizer(
-                examples['text'],
-                truncation=True,
-                max_length=self.args.seq_len,
-                padding='max_length',
-                return_tensors='pt'
-            )
+        # Use Dobi-SVD's dataset loading function
+        tokenized_traindata, tokenized_valdata = prepare_train_loaders(
+            tokenizer=self.tokenizer,
+            DATASET_NAME=self.args.dataset,
+            data_cache_dir=data_cache_dir,
+            dataset_cache_dir=dataset_cache_dir,
+            args=self.args
+        )
 
-        print(f"Tokenizing train data...")
-        if hasattr(train_data, 'map'):
-            train_tokenized = train_data.map(
-                tokenize_function,
-                batched=True,
-                remove_columns=train_data.column_names
-            )
-        else:
-            # For streaming datasets
-            train_tokenized = train_data
-
-        print(f"Tokenizing eval data...")
-        if hasattr(eval_data, 'map'):
-            eval_tokenized = eval_data.map(
-                tokenize_function,
-                batched=True,
-                remove_columns=eval_data.column_names
-            )
-        else:
-            eval_tokenized = eval_data
-
-        # Create dataloaders
+        # Create dataloaders from tokenized data
         self.train_loader = DataLoader(
-            train_tokenized,
+            tokenized_traindata,
             batch_size=self.args.batch_size,
             shuffle=True,
             num_workers=self.args.num_workers
         )
 
         self.eval_loader = DataLoader(
-            eval_tokenized,
+            tokenized_valdata,
             batch_size=self.args.batch_size,
             shuffle=False,
             num_workers=self.args.num_workers
         )
 
+        print(f"Train samples: {len(tokenized_traindata)}")
+        print(f"Eval samples: {len(tokenized_valdata)}")
         print(f"Train batches: {len(self.train_loader)}")
         print(f"Eval batches: {len(self.eval_loader)}")
 
@@ -494,8 +472,8 @@ def parse_args():
     # Model arguments
     parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf',
                        help='Model name or path')
-    parser.add_argument('--dataset', type=str, default='wikitext',
-                       choices=['wikitext', 'c4'], help='Dataset name')
+    parser.add_argument('--dataset', type=str, default='wikitext2',
+                       choices=['wikitext2', 'c4', 'ptb'], help='Dataset name')
 
     # Matryoshka SVD arguments
     parser.add_argument('--r_max', type=int, default=128,
@@ -537,6 +515,22 @@ def parse_args():
                        help='Weight decay')
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                        help='Max gradient norm for clipping')
+
+    # Dataset arguments (from Dobi-SVD)
+    parser.add_argument('--n_train_samples', type=int, default=256,
+                       help='Number of samples used for training')
+    parser.add_argument('--n_eval_samples', type=int, default=256,
+                       help='Number of samples used for evaluation')
+    parser.add_argument('--seed', type=int, default=0,
+                       help='Random seed')
+    parser.add_argument('--SAVE', action='store_true', default=False,
+                       help='Whether to save the generated dataset')
+    parser.add_argument('--RECREATE', action='store_true', default=False,
+                       help='Whether to regenerate the dataset')
+    parser.add_argument('--DO_SAMPLE', action='store_true', default=False,
+                       help='Whether to obtain the dataset by sampling')
+    parser.add_argument('--path_head_folder', type=str, default='./',
+                       help='Path of the model and dataset cache')
 
     # System arguments
     parser.add_argument('--output_dir', type=str, default='./output_matryoshka',
