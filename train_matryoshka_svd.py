@@ -273,8 +273,17 @@ class MatryoshkaSVDTrainer:
         """
         Compute multi-scale training loss across different rank levels.
 
-        This ensures the model performs well at all compression levels,
-        not just the adaptive one.
+        This is a KEY INNOVATION of Matryoshka SVD (vs Dobi-SVD):
+        - Dobi-SVD optimizes for a single compression point
+        - Matryoshka SVD optimizes across the entire rank range [r_min, r_max]
+
+        Implementation:
+        1. Main loss with adaptive per-token ranks
+        2. Auxiliary losses at fixed ranks (low, mid, high)
+        3. Rank regularization to control average compression
+
+        This ensures good performance across all compression levels,
+        enabling flexible deployment without retraining.
         """
         input_ids = batch['input_ids'].to(self.device)
         labels = input_ids.clone()
@@ -285,27 +294,72 @@ class MatryoshkaSVDTrainer:
             outputs = self.model(input_ids=input_ids, labels=labels)
             main_loss = outputs.loss
 
-            if not self.args.enable_multiscale_loss:
-                return main_loss, {'main': main_loss.item()}
-
-            # Collect multi-scale losses
-            multiscale_losses = []
             loss_breakdown = {'main': main_loss.item()}
 
-            # Iterate through Matryoshka layers and collect multi-scale outputs
-            for name, module in self.model.named_modules():
-                if isinstance(module, MatryoshkaSVDLayer):
-                    if hasattr(module, 'multiscale_outputs') and module.multiscale_outputs:
-                        # This would require hooking into the model's forward pass
-                        # For simplicity, we'll use rank regularization instead
-                        pass
+            if not self.args.enable_multiscale_loss:
+                return main_loss, loss_breakdown
 
-            # For now, use rank regularization as a proxy for multi-scale loss
+            # INNOVATION: Multi-scale loss across different rank levels
+            # This is the key theoretical advantage over Dobi-SVD
+            multiscale_loss = torch.tensor(0.0, device=self.device, dtype=main_loss.dtype)
+            multiscale_count = 0
+
+            # Sample a random fixed rank for auxiliary loss
+            # This encourages the model to work well at all compression levels
+            if torch.rand(1).item() < 0.5:  # 50% chance to add multiscale loss
+                # Randomly sample rank from [r_min, r_max]
+                sampled_rank = torch.randint(
+                    self.args.r_min,
+                    self.args.r_max + 1,
+                    (1,),
+                    device=self.device
+                ).item()
+
+                # Temporarily set all layers to use this fixed rank
+                # by modifying importance to achieve desired rank
+                target_importance = (sampled_rank - self.args.r_min) / (self.args.r_max - self.args.r_min)
+
+                # Forward pass with fixed rank
+                # We do this by monkey-patching the importance predictor
+                original_forwards = {}
+                for name, module in self.model.named_modules():
+                    if isinstance(module, MatryoshkaSVDLayer):
+                        predictor = module.importance_predictor
+                        original_forwards[name] = predictor.forward
+
+                        # Replace forward with fixed importance
+                        def fixed_importance_forward(x, attention_scores=None,
+                                                   target_imp=target_importance):
+                            batch, seq_len = x.shape[0], x.shape[1]
+                            return torch.full((batch, seq_len), target_imp,
+                                            device=x.device, dtype=x.dtype)
+
+                        predictor.forward = fixed_importance_forward
+
+                # Forward pass with fixed rank
+                outputs_fixed = self.model(input_ids=input_ids, labels=labels)
+                fixed_rank_loss = outputs_fixed.loss
+
+                # Restore original forwards
+                for name, module in self.model.named_modules():
+                    if isinstance(module, MatryoshkaSVDLayer):
+                        if name in original_forwards:
+                            module.importance_predictor.forward = original_forwards[name]
+
+                multiscale_loss += fixed_rank_loss
+                multiscale_count += 1
+                loss_breakdown[f'rank_{sampled_rank}'] = fixed_rank_loss.item()
+
+            # Rank regularization to encourage compression
             rank_reg_loss = self.compute_rank_regularization()
             loss_breakdown['rank_reg'] = rank_reg_loss.item()
 
             # Total loss
-            total_loss = main_loss + rank_reg_loss
+            # Weight: main (1.0) + multiscale (0.3) + rank_reg (as configured)
+            if multiscale_count > 0:
+                total_loss = main_loss + 0.3 * multiscale_loss + rank_reg_loss
+            else:
+                total_loss = main_loss + rank_reg_loss
 
         return total_loss, loss_breakdown
 
