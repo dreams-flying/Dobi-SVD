@@ -86,11 +86,18 @@ class MatryoshkaSVDTrainer:
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # MEMORY OPTIMIZATION: Load model with low memory usage
-        print(f"  Loading with low_cpu_mem_usage=True and device_map='auto'")
+        # NOTE: For mixed precision training with GradScaler, model must be in FP32
+        # and autocast handles the FP16 conversions during forward pass
+        if self.args.use_fp16:
+            print(f"  Loading model in FP32 for proper mixed precision training with autocast")
+            torch_dtype = torch.float32
+        else:
+            print(f"  Loading model in FP32")
+            torch_dtype = torch.float32
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.args.model,
-            torch_dtype=torch.float16 if self.args.use_fp16 else torch.float32,
+            torch_dtype=torch_dtype,
             device_map='auto' if torch.cuda.is_available() else None,
             low_cpu_mem_usage=True  # CRITICAL for large models
         )
