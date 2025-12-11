@@ -152,12 +152,22 @@ class MatryoshkaSVDTrainer:
         print(f"  Learnable singular values: {svd_config.learnable_singular_values}")
         print(f"  Activation-aware init: {svd_config.activation_aware_init}")
         print(f"  Auto rank range: {svd_config.auto_rank_range}")
+        print(f"  Bucketed inference: {svd_config.use_bucketed_inference}")
+
+        # Collect calibration data if activation-aware initialization is enabled
+        calibration_data = None
+        if svd_config.activation_aware_init:
+            print(f"\n📊 Collecting calibration data for activation-aware SVD...")
+            calibration_data = self.collect_calibration_data(
+                num_samples=self.args.calibration_samples
+            )
+            print(f"  Collected calibration data for {len(calibration_data)} layers")
 
         self.model = replace_linear_with_matryoshka_svd(
             self.model,
             target_layers=target_layers,
             config=svd_config,
-            calibration_data=None,  # TODO: Add calibration data collection
+            calibration_data=calibration_data,
             verbose=True
         )
 
@@ -214,6 +224,96 @@ class MatryoshkaSVDTrainer:
             print(f"  Memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
         self.model.train()
+
+    def collect_calibration_data(self, num_samples: int = 128) -> Dict[str, torch.Tensor]:
+        """
+        Collect calibration data for activation-aware SVD initialization.
+
+        Args:
+            num_samples: Number of samples to use for calibration
+
+        Returns:
+            Dict mapping layer names to activation tensors [num_samples, hidden_size]
+        """
+        print(f"\n📊 Collecting calibration data ({num_samples} samples)...")
+
+        # Temporarily prepare data if not already done
+        if not hasattr(self, 'train_loader'):
+            self.prepare_data()
+
+        calibration_data = {}
+        hooks = []
+
+        # Register forward hooks to capture activations
+        def make_hook(name):
+            def hook(module, input, output):
+                if name not in calibration_data:
+                    calibration_data[name] = []
+                # Store input activations (before the linear layer)
+                if isinstance(input, tuple):
+                    input_tensor = input[0]
+                else:
+                    input_tensor = input
+
+                # Flatten batch and sequence dimensions
+                # Shape: [batch, seq, hidden] -> [batch*seq, hidden]
+                act = input_tensor.detach().cpu().reshape(-1, input_tensor.shape[-1])
+                calibration_data[name].append(act)
+            return hook
+
+        # Register hooks for target layers
+        target_patterns = self.args.target_layers.split(',') if self.args.target_layers else []
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                should_hook = any(pattern in name for pattern in target_patterns)
+                if should_hook:
+                    hook = module.register_forward_hook(make_hook(name))
+                    hooks.append(hook)
+
+        # Run forward passes to collect activations
+        self.model.eval()
+        collected = 0
+
+        with torch.no_grad():
+            for batch in self.train_loader:
+                if collected >= num_samples:
+                    break
+
+                input_ids = batch['input_ids'].to(next(self.model.parameters()).device)
+
+                # Forward pass (will trigger hooks)
+                try:
+                    _ = self.model(input_ids=input_ids, use_cache=False)
+                except:
+                    pass  # Ignore errors, we just need the activations
+
+                collected += input_ids.shape[0]
+
+                # Clear memory
+                del input_ids
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+
+        # Concatenate and subsample to exactly num_samples
+        final_calibration_data = {}
+        for layer_name, acts_list in calibration_data.items():
+            acts = torch.cat(acts_list, dim=0)  # [total_tokens, hidden]
+
+            # Subsample to num_samples
+            if acts.shape[0] > num_samples:
+                indices = torch.randperm(acts.shape[0])[:num_samples]
+                acts = acts[indices]
+
+            final_calibration_data[layer_name] = acts
+            print(f"  {layer_name}: {acts.shape}")
+
+        self.model.train()
+
+        return final_calibration_data
 
     def prepare_data(self):
         """Prepare training and evaluation datasets."""
@@ -740,6 +840,8 @@ def parse_args():
                        help='Enable learnable singular values for fine-tuning')
     parser.add_argument('--activation_aware_init', action='store_true',
                        help='Use activation-aware SVD initialization (requires calibration data)')
+    parser.add_argument('--calibration_samples', type=int, default=128,
+                       help='Number of samples for calibration data collection (default: 128)')
     parser.add_argument('--auto_rank_range', action='store_true',
                        help='Automatically determine r_min and r_max based on spectral energy')
     parser.add_argument('--energy_threshold_low', type=float, default=0.90,

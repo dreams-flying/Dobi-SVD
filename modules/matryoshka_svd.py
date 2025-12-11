@@ -60,6 +60,10 @@ class MatryoshkaSVDConfig:
     energy_threshold_low: float = 0.90   # r_min: 90% energy
     energy_threshold_high: float = 0.99  # r_max: 99% energy
 
+    # Bucketed inference for dynamic computation
+    use_bucketed_inference: bool = True   # Enable bucketed inference
+    num_inference_buckets: int = 4        # Number of rank buckets
+
 
 # ============================================================================
 # Enhanced Adaptive Rank Predictor
@@ -304,6 +308,17 @@ class MatryoshkaSVDLayer(nn.Module):
             'sequence_tensor',
             torch.arange(self.r_max, dtype=torch.float32, device=self.device)
         )
+
+        # Bucketed inference: precompute bucket boundaries
+        if self.config.use_bucketed_inference:
+            bucket_ranks = torch.linspace(
+                self.r_min, self.r_max, self.config.num_inference_buckets + 1
+            ).long()
+            self.register_buffer('bucket_boundaries', bucket_ranks)
+            print(f"  Bucketed inference enabled: {self.config.num_inference_buckets} buckets")
+            print(f"    Bucket boundaries: {bucket_ranks.tolist()}")
+        else:
+            self.bucket_boundaries = None
 
         # Statistics tracking
         self.register_buffer(
@@ -579,25 +594,12 @@ class MatryoshkaSVDLayer(nn.Module):
         adaptive_rank = self.r_min + (self.r_max - self.r_min) * importance
         adaptive_rank = torch.clamp(adaptive_rank, self.r_min, self.r_max)
 
-        # Step 3: Compute soft truncation weights
-        truncation = self.compute_soft_truncation(adaptive_rank)  # [batch, seq, r_max]
-
-        # Step 4: Apply truncation to singular values
-        S_adaptive = S.unsqueeze(0).unsqueeze(0) * truncation  # [batch, seq, r_max]
-
-        # Step 5: SVD transformation
-        V_compute = self.V.to(input_dtype)
-        U_compute = self.U.to(input_dtype)
-        S_adaptive_compute = S_adaptive.to(input_dtype)
-
-        # x @ V^T: [batch, seq, input_size] @ [input_size, r_max] → [batch, seq, r_max]
-        xV = torch.matmul(x, V_compute.T)
-
-        # Element-wise multiply with adaptive S: [batch, seq, r_max]
-        xVS = xV * S_adaptive_compute
-
-        # @ U^T: [batch, seq, r_max] @ [r_max, output_size] → [batch, seq, output_size]
-        output = torch.matmul(xVS, U_compute.T)
+        # Step 3: Choose forward method
+        # Use bucketed inference during evaluation for speed
+        if not self.training and self.config.use_bucketed_inference and self.bucket_boundaries is not None:
+            output = self._forward_bucketed(x, adaptive_rank, S, input_dtype)
+        else:
+            output = self._forward_soft(x, adaptive_rank, S, input_dtype)
 
         # Add bias if present
         if self.bias is not None:
@@ -626,6 +628,117 @@ class MatryoshkaSVDLayer(nn.Module):
                 'singular_values': S.detach() if not self.config.learnable_singular_values else S
             }
             return output, rank_info
+
+        return output
+
+    def _forward_soft(
+        self,
+        x: torch.Tensor,
+        adaptive_rank: torch.Tensor,
+        S: torch.Tensor,
+        dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Standard soft-truncation forward pass (used during training).
+
+        Args:
+            x: Input tensor [batch, seq_len, input_size]
+            adaptive_rank: Per-token ranks [batch, seq_len]
+            S: Singular values [r_max]
+            dtype: Computation dtype
+
+        Returns:
+            output: [batch, seq_len, output_size]
+        """
+        # Compute soft truncation weights
+        truncation = self.compute_soft_truncation(adaptive_rank)  # [batch, seq, r_max]
+
+        # Adaptive singular values
+        S_adaptive = S.unsqueeze(0).unsqueeze(0) * truncation  # [batch, seq, r_max]
+
+        # Transform
+        V = self.V.to(dtype)
+        U = self.U.to(dtype)
+        S_adaptive = S_adaptive.to(dtype)
+
+        # x @ V^T -> [batch, seq, r_max]
+        xV = torch.matmul(x, V.T)
+
+        # Element-wise multiply with S
+        xVS = xV * S_adaptive
+
+        # @ U^T -> [batch, seq, output_size]
+        output = torch.matmul(xVS, U.T)
+
+        return output
+
+    def _forward_bucketed(
+        self,
+        x: torch.Tensor,
+        adaptive_rank: torch.Tensor,
+        S: torch.Tensor,
+        dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Bucketed forward pass for efficient inference with dynamic computation.
+
+        Key idea: Group tokens by their rank, process each group with only
+        the required number of singular components, avoiding unnecessary computation.
+
+        Args:
+            x: Input tensor [batch, seq_len, input_size]
+            adaptive_rank: Per-token ranks [batch, seq_len]
+            S: Singular values [r_max]
+            dtype: Computation dtype
+
+        Returns:
+            output: [batch, seq_len, output_size]
+        """
+        batch_size, seq_len, _ = x.shape
+        output = torch.zeros(batch_size, seq_len, self.output_size, device=x.device, dtype=dtype)
+
+        V = self.V.to(dtype)
+        U = self.U.to(dtype)
+        S = S.to(dtype)
+
+        # Process each bucket
+        for i in range(len(self.bucket_boundaries) - 1):
+            r_low = self.bucket_boundaries[i].item()
+            r_high = self.bucket_boundaries[i + 1].item()
+            r_use = r_high  # Use the upper bound of the bucket
+
+            # Find tokens in this bucket
+            if i == 0:
+                mask = adaptive_rank < r_high
+            elif i == len(self.bucket_boundaries) - 2:
+                mask = adaptive_rank >= r_low
+            else:
+                mask = (adaptive_rank >= r_low) & (adaptive_rank < r_high)
+
+            if not mask.any():
+                continue
+
+            # Extract tokens (flatten batch and seq)
+            flat_mask = mask.view(-1)
+            x_flat = x.view(-1, x.shape[-1])
+            x_bucket = x_flat[flat_mask]  # [num_tokens_in_bucket, input_size]
+
+            if x_bucket.shape[0] == 0:
+                continue
+
+            # Compute with truncated SVD components
+            V_trunc = V[:r_use, :]  # [r_use, input_size]
+            U_trunc = U[:, :r_use]  # [output_size, r_use]
+            S_trunc = S[:r_use]     # [r_use]
+
+            # Forward: x @ V^T @ diag(S) @ U^T
+            xV = torch.matmul(x_bucket, V_trunc.T)  # [num_tokens, r_use]
+            xVS = xV * S_trunc.unsqueeze(0)        # [num_tokens, r_use]
+            out_bucket = torch.matmul(xVS, U_trunc.T)  # [num_tokens, output_size]
+
+            # Put back
+            output_flat = output.view(-1, self.output_size)
+            output_flat[flat_mask] = out_bucket
 
         return output
 
