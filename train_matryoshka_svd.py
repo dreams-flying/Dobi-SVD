@@ -48,7 +48,11 @@ from tqdm import tqdm
 # Add modules to path
 sys.path.append(str(Path(__file__).parent))
 
-from modules.matryoshka_svd import MatryoshkaSVDLayer, replace_linear_with_matryoshka_svd
+from modules.matryoshka_svd import (
+    MatryoshkaSVDConfig,
+    MatryoshkaSVDLayer,
+    replace_linear_with_matryoshka_svd
+)
 from utils.datautils import prepare_train_loaders
 
 
@@ -123,15 +127,38 @@ class MatryoshkaSVDTrainer:
         print(f"  - Clearing GPU cache after each layer")
         print(f"  - Using CPU for all SVD computations")
 
-        self.model = replace_linear_with_matryoshka_svd(
-            self.model,
-            target_layers=target_layers,
+        # Create configuration for Matryoshka SVD
+        svd_config = MatryoshkaSVDConfig(
             r_max=self.args.r_max,
             r_min=self.args.r_min,
             importance_strategy=self.args.importance_strategy,
             temperature=self.args.temperature,
-            verbose=True,
-            aggressive_memory_saving=True  # CRITICAL for low memory
+            soft_truncation_margin=self.args.soft_truncation_margin,
+            enable_multiscale_loss=self.args.enable_multiscale_loss,
+            rank_regularization_weight=self.args.rank_reg_weight,
+            learnable_singular_values=self.args.learnable_singular_values,
+            activation_aware_init=self.args.activation_aware_init,
+            spectral_regularization_weight=self.args.spectral_reg_weight,
+            auto_rank_range=self.args.auto_rank_range,
+            energy_threshold_low=self.args.energy_threshold_low,
+            energy_threshold_high=self.args.energy_threshold_high
+        )
+
+        print(f"\n📋 Matryoshka SVD Configuration:")
+        print(f"  Rank range: [{svd_config.r_min}, {svd_config.r_max}]")
+        print(f"  Importance strategy: {svd_config.importance_strategy}")
+        print(f"  Temperature: {svd_config.temperature}")
+        print(f"  Soft truncation margin: {svd_config.soft_truncation_margin}")
+        print(f"  Learnable singular values: {svd_config.learnable_singular_values}")
+        print(f"  Activation-aware init: {svd_config.activation_aware_init}")
+        print(f"  Auto rank range: {svd_config.auto_rank_range}")
+
+        self.model = replace_linear_with_matryoshka_svd(
+            self.model,
+            target_layers=target_layers,
+            config=svd_config,
+            calibration_data=None,  # TODO: Add calibration data collection
+            verbose=True
         )
 
         compressed_params = sum(p.numel() for p in self.model.parameters())
@@ -402,20 +429,27 @@ class MatryoshkaSVDTrainer:
                     # CRITICAL: Delete intermediate tensors
                     del fixed_rank_loss
 
-            # Rank regularization to encourage compression
+            # Regularization losses
             rank_reg_loss = self.compute_rank_regularization()
+            spectral_reg_loss = self.compute_spectral_regularization()
             loss_breakdown['rank_reg'] = rank_reg_loss.item()
+            loss_breakdown['spectral_reg'] = spectral_reg_loss.item()
 
             # Total loss
-            # Weight: main (1.0) + multiscale (avg 0.3 per rank) + rank_reg (as configured)
+            # Weight: main (1.0) + multiscale (avg 0.3 per rank) + rank_reg + spectral_reg
             # CRITICAL: Move all losses to main_loss_value's device (for multi-GPU)
             # IMPROVED: Normalize multiscale_loss by count to maintain consistent weighting
             if multiscale_count > 0:
                 # Average the multiscale loss across all sampled ranks
                 avg_multiscale_loss = multiscale_loss.to(main_loss_value.device) / multiscale_count
-                total_loss = main_loss_value + 0.3 * avg_multiscale_loss + rank_reg_loss.to(main_loss_value.device)
+                total_loss = (main_loss_value +
+                             0.3 * avg_multiscale_loss +
+                             rank_reg_loss.to(main_loss_value.device) +
+                             spectral_reg_loss.to(main_loss_value.device))
             else:
-                total_loss = main_loss_value + rank_reg_loss.to(main_loss_value.device)
+                total_loss = (main_loss_value +
+                             rank_reg_loss.to(main_loss_value.device) +
+                             spectral_reg_loss.to(main_loss_value.device))
 
         return total_loss, loss_breakdown
 
@@ -439,7 +473,26 @@ class MatryoshkaSVDTrainer:
         if count > 0:
             rank_reg_loss /= count
 
-        return rank_reg_loss * self.args.rank_reg_weight
+        return rank_reg_loss
+
+    def compute_spectral_regularization(self):
+        """Compute spectral regularization loss for learnable singular values."""
+        spectral_reg_loss = 0.0
+        count = 0
+
+        # Get target device
+        target_device = next(self.model.parameters()).device
+
+        for module in self.model.modules():
+            if isinstance(module, MatryoshkaSVDLayer):
+                layer_loss = module.get_spectral_regularization_loss()
+                spectral_reg_loss += layer_loss.to(target_device)
+                count += 1
+
+        if count > 0:
+            spectral_reg_loss /= count
+
+        return spectral_reg_loss
 
     def train_epoch(self, epoch):
         """Train for one epoch with gradient accumulation."""
@@ -677,8 +730,25 @@ def parse_args():
     parser.add_argument('--importance_strategy', type=str, default='norm',
                        choices=['norm', 'learned', 'attention'],
                        help='Importance computation strategy')
-    parser.add_argument('--temperature', type=float, default=0.1,
+    parser.add_argument('--temperature', type=float, default=1.0,
                        help='Soft truncation temperature')
+    parser.add_argument('--soft_truncation_margin', type=float, default=2.0,
+                       help='Soft truncation margin (higher = sharper transition)')
+
+    # Enhanced features
+    parser.add_argument('--learnable_singular_values', action='store_true',
+                       help='Enable learnable singular values for fine-tuning')
+    parser.add_argument('--activation_aware_init', action='store_true',
+                       help='Use activation-aware SVD initialization (requires calibration data)')
+    parser.add_argument('--auto_rank_range', action='store_true',
+                       help='Automatically determine r_min and r_max based on spectral energy')
+    parser.add_argument('--energy_threshold_low', type=float, default=0.90,
+                       help='Energy threshold for r_min (default: 90%%)')
+    parser.add_argument('--energy_threshold_high', type=float, default=0.99,
+                       help='Energy threshold for r_max (default: 99%%)')
+    parser.add_argument('--spectral_reg_weight', type=float, default=0.0001,
+                       help='Spectral regularization weight (for learnable S)')
+
     parser.add_argument('--target_layers', type=str, default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
                        help='Comma-separated layer patterns to compress')
     parser.add_argument('--target_compression', type=float, default=0.15,
