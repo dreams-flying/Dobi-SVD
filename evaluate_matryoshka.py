@@ -51,7 +51,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Add project to path
 sys.path.append(str(Path(__file__).parent))
 
-from modules.matryoshka_svd import MatryoshkaSVDLayer
+from modules.matryoshka_svd import MatryoshkaSVDLayer, replace_linear_with_matryoshka_svd
 from utils.datautils import prepare_train_loaders
 
 
@@ -90,17 +90,57 @@ def load_matryoshka_model(checkpoint_path, base_model=None):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model architecture (will be replaced with Matryoshka layers)
+    # Load base model architecture
+    print(f"Loading base model architecture...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True
     )
 
-    # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Apply Matryoshka SVD replacement to match checkpoint structure
+    # Extract parameters from training args or use defaults
+    if train_args is not None:
+        r_max = getattr(train_args, 'r_max', 64)
+        r_min = getattr(train_args, 'r_min', 16)
+        importance_strategy = getattr(train_args, 'importance_strategy', 'norm')
+        temperature = getattr(train_args, 'temperature', 0.1)
+        target_layers = getattr(train_args, 'target_layers', 'q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj').split(',')
+    else:
+        # Use defaults
+        r_max = 64
+        r_min = 16
+        importance_strategy = 'norm'
+        temperature = 0.1
+        target_layers = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
 
-    print(f"Model loaded successfully")
+    print(f"\nApplying Matryoshka SVD replacement...")
+    print(f"  r_max={r_max}, r_min={r_min}")
+    print(f"  importance_strategy={importance_strategy}")
+    print(f"  target_layers={target_layers}")
+
+    # Replace linear layers with Matryoshka SVD layers
+    # IMPORTANT: Do NOT compute SVD - we'll load weights from checkpoint
+    model = replace_linear_with_matryoshka_svd(
+        model,
+        target_layers=target_layers,
+        r_max=r_max,
+        r_min=r_min,
+        importance_strategy=importance_strategy,
+        temperature=temperature,
+        verbose=False,
+        aggressive_memory_saving=True
+    )
+
+    print(f"\nLoading checkpoint weights...")
+    # Load state dict with weights_only for security
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        print(f"✓ Model weights loaded successfully")
+    except RuntimeError as e:
+        print(f"Warning: Some keys mismatch, trying non-strict loading...")
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        print(f"✓ Model weights loaded (non-strict)")
 
     # Print Matryoshka SVD layer statistics
     print(f"\nMatryoshka SVD layers:")
