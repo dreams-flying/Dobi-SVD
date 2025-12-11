@@ -85,27 +85,26 @@ class MatryoshkaSVDTrainer:
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # MEMORY OPTIMIZATION: Load model with low memory usage
-        # NOTE: For mixed precision training with GradScaler, model must be in FP32
-        # and autocast handles the FP16 conversions during forward pass
-        if self.args.use_fp16:
-            print(f"  Loading model in FP32 for proper mixed precision training with autocast")
-            torch_dtype = torch.float32
-        else:
-            print(f"  Loading model in FP32")
-            torch_dtype = torch.float32
+        # CRITICAL MEMORY FIX: Load model on CPU FIRST
+        # Then replace layers on CPU, finally move to GPU
+        # This prevents OOM when old and new layers compete for GPU memory during replacement
+        print(f"  CRITICAL: Loading model on CPU (not GPU)")
+        print(f"  Will perform SVD replacement on CPU, then move to GPU")
+        print(f"  This prevents OOM during layer replacement phase")
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.args.model,
-            torch_dtype=torch_dtype,
-            device_map='auto' if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True  # CRITICAL for large models
+            torch_dtype=torch.float32,  # Always FP32 for proper mixed precision training
+            device_map=None,  # CRITICAL: Load on CPU, not GPU
+            low_cpu_mem_usage=True
         )
 
         # Clear cache after loading
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print(f"  Memory after loading: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
 
         print(f"Model loaded: {self.model.config.model_type}")
         original_params = sum(p.numel() for p in self.model.parameters())
@@ -151,12 +150,41 @@ class MatryoshkaSVDTrainer:
             torch.cuda.empty_cache()
             gc.collect()
             torch.cuda.empty_cache()
-            print(f"  Memory after compression: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-            print(f"  Memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
-        # Move to device if not using device_map
-        if not torch.cuda.is_available() or self.args.no_device_map:
-            self.model = self.model.to(self.device)
+        # CRITICAL: Now move model from CPU to GPU
+        # Since we loaded with device_map=None, model is on CPU
+        # We must explicitly move it to GPU for training
+        if torch.cuda.is_available():
+            print(f"\n{'='*80}")
+            print(f"Moving model from CPU to GPU...")
+            print(f"{'='*80}")
+
+            # Use device_map='auto' for optimal multi-GPU distribution
+            from accelerate import dispatch_model, infer_auto_device_map
+            from accelerate.utils import get_balanced_memory
+
+            # Get available GPU memory
+            max_memory = get_balanced_memory(
+                self.model,
+                max_memory=None,
+                no_split_module_classes=["LlamaDecoderLayer"],
+                dtype=torch.float32
+            )
+
+            # Infer device map
+            device_map = infer_auto_device_map(
+                self.model,
+                max_memory=max_memory,
+                no_split_module_classes=["LlamaDecoderLayer"],
+                dtype=torch.float32
+            )
+
+            # Dispatch model to devices
+            self.model = dispatch_model(self.model, device_map=device_map)
+
+            print(f"✓ Model moved to GPU")
+            print(f"  Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+            print(f"  Memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
         self.model.train()
 
