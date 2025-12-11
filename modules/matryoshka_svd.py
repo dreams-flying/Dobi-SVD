@@ -432,89 +432,54 @@ class MatryoshkaSVDLayer(nn.Module):
         calibration_data: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Activation-aware SVD (借鉴 Dobi-SVD) with numerical stability fixes.
+        Simplified activation-aware SVD inspired by Dobi-SVD.
 
-        This reweights the SVD to prioritize directions important for actual data.
-        Mathematically: SVD of W @ C^{1/2} where C = X^T X / n
+        Key idea (from Dobi-SVD philosophy):
+        - Dobi does SVD on activations: U, S, V = svd(X) in forward pass
+        - For Matryoshka (precomputed SVD on weights), we:
+          1. Do standard SVD on weight: U, S, V = svd(W)
+          2. Reorder components by activation importance
+          3. Keep most important components first
+
+        This is much simpler and more stable than matrix transformation.
         """
-        print(f"  Using {calibration_data.shape[0]} calibration samples")
+        print(f"  Using {calibration_data.shape[0]} calibration samples for activation-aware SVD")
 
+        # Step 1: Standard SVD on weight
+        print(f"  Computing standard SVD on weight...")
+        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
+
+        # Step 2: Compute activation importance for each component
+        # For each singular component, measure how much it's activated by real data
         X = calibration_data  # [num_samples, input_size]
 
-        # CRITICAL: Normalize X for numerical stability
-        X_mean = X.mean(dim=0, keepdim=True)
-        X_std = X.std(dim=0, keepdim=True) + 1e-8
-        X_normalized = (X - X_mean) / X_std
+        print(f"  Computing component activations...")
+        # V^T @ X^T: each row of Vh represents a component direction
+        # X @ Vh.T gives how each component responds to inputs
+        component_activations = X @ Vh.T  # [num_samples, rank]
 
-        # Compute input covariance matrix on normalized data
-        cov = X_normalized.T @ X_normalized / X_normalized.shape[0]  # [input_size, input_size]
+        # Importance = average absolute activation across all samples
+        component_importance = component_activations.abs().mean(dim=0)  # [rank]
 
-        # CRITICAL: Stronger regularization for large matrices
-        reg_strength = max(1e-4, 1e-6 * cov.shape[0])  # Scale with dimension
-        cov = cov + reg_strength * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+        print(f"  Component importance range: [{component_importance.min():.4f}, {component_importance.max():.4f}]")
 
-        # Eigendecomposition of covariance
-        print(f"  Computing eigendecomposition of covariance matrix...")
-        try:
-            eigvals, eigvecs = torch.linalg.eigh(cov)
-        except RuntimeError as e:
-            print(f"  ⚠️  Eigendecomposition failed: {e}, falling back to standard SVD")
-            return self._standard_svd(weight)
+        # Step 3: Reorder by importance (most important first)
+        importance_order = component_importance.argsort(descending=True)
 
-        # CRITICAL: Clamp eigenvalues and filter out tiny ones
-        eigvals = eigvals.clamp(min=1e-6)
-        valid_mask = eigvals > 1e-4  # Filter out very small eigenvalues
-        eigvals = eigvals[valid_mask]
-        eigvecs = eigvecs[:, valid_mask]
+        # Apply reordering
+        U_reordered = U[:, importance_order]
+        S_reordered = S[importance_order]
+        V_reordered = Vh[importance_order, :]
 
-        print(f"  Kept {eigvals.shape[0]} / {cov.shape[0]} eigenvalues (filtered tiny ones)")
-
-        # Compute C^{1/2} with numerical safety
-        eigvals_sqrt = eigvals.sqrt()
-        C_sqrt = eigvecs @ torch.diag(eigvals_sqrt) @ eigvecs.T
-
-        # CRITICAL: Clip C_sqrt to prevent numerical explosion
-        C_sqrt = torch.clamp(C_sqrt, -10.0, 10.0)
-
-        # Weight the matrix: W_weighted = W @ C^{1/2}
-        print(f"  Computing weighted matrix W @ C^{{1/2}}...")
-        W_weighted = weight @ C_sqrt
-
-        # Check for NaN/Inf
-        if not torch.isfinite(W_weighted).all():
-            print(f"  ⚠️  W_weighted contains NaN/Inf, falling back to standard SVD")
-            return self._standard_svd(weight)
-
-        # SVD of weighted matrix
-        print(f"  Computing SVD of weighted matrix...")
-        try:
-            U, S, Vh = torch.linalg.svd(W_weighted, full_matrices=False)
-        except RuntimeError as e:
-            print(f"  ⚠️  SVD failed: {e}, falling back to standard SVD")
-            return self._standard_svd(weight)
-
-        # Transform V back: V_original = V_weighted @ C^{-1/2}
-        # CRITICAL: Use safe division
-        eigvals_sqrt_inv = 1.0 / (eigvals_sqrt + 1e-8)  # Add epsilon before division
-        C_sqrt_inv = eigvecs @ torch.diag(eigvals_sqrt_inv) @ eigvecs.T
-
-        V = Vh[:self.r_max, :] @ C_sqrt_inv.T
-
-        # Re-normalize V rows to unit norm
-        V_norm = V.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        V = V / V_norm
-
-        # Final safety check
-        if not torch.isfinite(V).all():
-            print(f"  ⚠️  V contains NaN/Inf, falling back to standard SVD")
-            return self._standard_svd(weight)
-
-        U = U[:, :self.r_max]
-        S = S[:self.r_max]
+        # Truncate to r_max
+        U_final = U_reordered[:, :self.r_max]
+        S_final = S_reordered[:self.r_max]
+        V_final = V_reordered[:self.r_max, :]
 
         print(f"  Activation-aware SVD complete!")
+        print(f"  Top 5 component importance: {component_importance[importance_order[:5]].tolist()}")
 
-        return U, S, V
+        return U_final, S_final, V_final
 
     @staticmethod
     def _randomized_svd(
