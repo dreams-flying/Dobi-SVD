@@ -145,10 +145,14 @@ class MatryoshkaSVDTrainer:
             print("\n⚠️  Enabling gradient checkpointing to save memory")
             self.model.gradient_checkpointing_enable()
 
-        # Clear cache after compression
+        # CRITICAL: Aggressive memory cleanup after SVD replacement
         if torch.cuda.is_available():
+            import gc
+            torch.cuda.empty_cache()
+            gc.collect()
             torch.cuda.empty_cache()
             print(f"  Memory after compression: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+            print(f"  Memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
         # Move to device if not using device_map
         if not torch.cuda.is_available() or self.args.no_device_map:
@@ -294,19 +298,25 @@ class MatryoshkaSVDTrainer:
             outputs = self.model(input_ids=input_ids, labels=labels)
             main_loss = outputs.loss
 
-            loss_breakdown = {'main': main_loss.item()}
+            # CRITICAL: Extract loss and delete outputs immediately to save memory
+            main_loss_value = main_loss.clone()
+            del outputs
+            torch.cuda.empty_cache()
+
+            loss_breakdown = {'main': main_loss_value.item()}
 
             if not self.args.enable_multiscale_loss:
-                return main_loss, loss_breakdown
+                return main_loss_value, loss_breakdown
 
             # INNOVATION: Multi-scale loss across different rank levels
             # This is the key theoretical advantage over Dobi-SVD
-            multiscale_loss = torch.tensor(0.0, device=self.device, dtype=main_loss.dtype)
+            multiscale_loss = torch.tensor(0.0, device=self.device, dtype=main_loss_value.dtype)
             multiscale_count = 0
 
             # Sample a random fixed rank for auxiliary loss
             # This encourages the model to work well at all compression levels
-            if torch.rand(1).item() < 0.5:  # 50% chance to add multiscale loss
+            # MEMORY: Reduce frequency to 20% to save memory
+            if torch.rand(1).item() < 0.2:  # 20% chance (was 50%)
                 # Randomly sample rank from [r_min, r_max]
                 sampled_rank = torch.randint(
                     self.args.r_min,
@@ -336,9 +346,16 @@ class MatryoshkaSVDTrainer:
 
                         predictor.forward = fixed_importance_forward
 
+                # CRITICAL: Clear cache before second forward pass
+                torch.cuda.empty_cache()
+
                 # Forward pass with fixed rank
                 outputs_fixed = self.model(input_ids=input_ids, labels=labels)
-                fixed_rank_loss = outputs_fixed.loss
+                fixed_rank_loss = outputs_fixed.loss.clone()
+
+                # CRITICAL: Delete outputs immediately
+                del outputs_fixed
+                torch.cuda.empty_cache()
 
                 # Restore original forwards
                 for name, module in self.model.named_modules():
@@ -350,6 +367,9 @@ class MatryoshkaSVDTrainer:
                 multiscale_count += 1
                 loss_breakdown[f'rank_{sampled_rank}'] = fixed_rank_loss.item()
 
+                # CRITICAL: Delete intermediate tensors
+                del fixed_rank_loss
+
             # Rank regularization to encourage compression
             rank_reg_loss = self.compute_rank_regularization()
             loss_breakdown['rank_reg'] = rank_reg_loss.item()
@@ -357,9 +377,9 @@ class MatryoshkaSVDTrainer:
             # Total loss
             # Weight: main (1.0) + multiscale (0.3) + rank_reg (as configured)
             if multiscale_count > 0:
-                total_loss = main_loss + 0.3 * multiscale_loss + rank_reg_loss
+                total_loss = main_loss_value + 0.3 * multiscale_loss + rank_reg_loss
             else:
-                total_loss = main_loss + rank_reg_loss
+                total_loss = main_loss_value + rank_reg_loss
 
         return total_loss, loss_breakdown
 
