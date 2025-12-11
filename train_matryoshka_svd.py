@@ -159,10 +159,26 @@ class MatryoshkaSVDTrainer:
         calibration_data = None
         if svd_config.activation_aware_init:
             print(f"\n📊 Collecting calibration data for activation-aware SVD...")
+
+            # CRITICAL: Temporarily move model to GPU for fast calibration
+            if torch.cuda.is_available():
+                print(f"  ⚡ Moving model to GPU for calibration (much faster than CPU)...")
+                device = torch.device('cuda:0')
+                self.model = self.model.to(device)
+                torch.cuda.empty_cache()
+
             calibration_data = self.collect_calibration_data(
                 num_samples=self.args.calibration_samples
             )
-            print(f"  Collected calibration data for {len(calibration_data)} layers")
+            print(f"  ✅ Collected calibration data for {len(calibration_data)} layers")
+
+            # Move model back to CPU for SVD replacement
+            if torch.cuda.is_available():
+                print(f"  Moving model back to CPU for SVD replacement...")
+                self.model = self.model.cpu()
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
 
         self.model = replace_linear_with_matryoshka_svd(
             self.model,
