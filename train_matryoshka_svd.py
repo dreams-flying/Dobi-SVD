@@ -338,7 +338,8 @@ class MatryoshkaSVDTrainer:
 
             # INNOVATION: Multi-scale loss across different rank levels
             # This is the key theoretical advantage over Dobi-SVD
-            multiscale_loss = torch.tensor(0.0, device=self.device, dtype=main_loss_value.dtype)
+            # CRITICAL: Use main_loss_value's device for multi-GPU compatibility
+            multiscale_loss = torch.tensor(0.0, device=main_loss_value.device, dtype=main_loss_value.dtype)
             multiscale_count = 0
 
             # Sample a random fixed rank for auxiliary loss
@@ -391,7 +392,8 @@ class MatryoshkaSVDTrainer:
                         if name in original_forwards:
                             module.importance_predictor.forward = original_forwards[name]
 
-                multiscale_loss += fixed_rank_loss
+                # CRITICAL: Move to same device as multiscale_loss (for multi-GPU)
+                multiscale_loss += fixed_rank_loss.to(multiscale_loss.device)
                 multiscale_count += 1
                 loss_breakdown[f'rank_{sampled_rank}'] = fixed_rank_loss.item()
 
@@ -404,10 +406,11 @@ class MatryoshkaSVDTrainer:
 
             # Total loss
             # Weight: main (1.0) + multiscale (0.3) + rank_reg (as configured)
+            # CRITICAL: Move all losses to main_loss_value's device (for multi-GPU)
             if multiscale_count > 0:
-                total_loss = main_loss_value + 0.3 * multiscale_loss + rank_reg_loss
+                total_loss = main_loss_value + 0.3 * multiscale_loss.to(main_loss_value.device) + rank_reg_loss.to(main_loss_value.device)
             else:
-                total_loss = main_loss_value + rank_reg_loss
+                total_loss = main_loss_value + rank_reg_loss.to(main_loss_value.device)
 
         return total_loss, loss_breakdown
 
@@ -416,9 +419,16 @@ class MatryoshkaSVDTrainer:
         rank_reg_loss = 0.0
         count = 0
 
+        # CRITICAL: Get target device for loss accumulation (first parameter's device)
+        # This handles multi-GPU scenarios where layers are on different devices
+        target_device = next(self.model.parameters()).device
+
         for module in self.model.modules():
             if isinstance(module, MatryoshkaSVDLayer):
-                rank_reg_loss += module.get_rank_regularization_loss()
+                # CRITICAL: Move each layer's loss to target device before summing
+                # When model is distributed across GPUs, layers may be on different devices
+                layer_loss = module.get_rank_regularization_loss()
+                rank_reg_loss += layer_loss.to(target_device)
                 count += 1
 
         if count > 0:
