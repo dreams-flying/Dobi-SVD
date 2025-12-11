@@ -350,7 +350,7 @@ class MatryoshkaSVDLayer(nn.Module):
 
     def compute_soft_truncation(self, adaptive_rank: torch.Tensor) -> torch.Tensor:
         """
-        Compute soft truncation weights using sigmoid function.
+        Compute soft truncation weights using improved sigmoid function.
 
         Args:
             adaptive_rank: Per-token ranks [batch, seq_len]
@@ -366,12 +366,16 @@ class MatryoshkaSVDLayer(nn.Module):
         r_expanded = adaptive_rank.unsqueeze(-1)  # [batch, seq, 1]
         seq_expanded = self.sequence_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, r_max]
 
-        # Soft truncation: sigmoid((r - k) / temperature)
-        # - When r >> k: sigmoid ≈ 1 (keep component)
-        # - When r << k: sigmoid ≈ 0 (discard component)
-        # - When r ≈ k: sigmoid ≈ 0.5 (soft transition)
+        # IMPROVED soft truncation: Add margin for sharper transition
+        # Problem: Original sigmoid((r-k)/τ) gives only 0.73 weight to k=r-1
+        # Solution: Shift decision boundary by adding margin
+        # - For k < r-2: sigmoid ≈ 1 (keep component)
+        # - For k > r+2: sigmoid ≈ 0 (discard component)
+        # - For k ≈ r: smooth transition
 
-        truncation = torch.sigmoid((r_expanded - seq_expanded) / self.temperature)
+        # Margin of 2.0 ensures components near r-1 get high weight
+        margin = 2.0
+        truncation = torch.sigmoid((r_expanded - seq_expanded + margin) / self.temperature)
 
         return truncation
 

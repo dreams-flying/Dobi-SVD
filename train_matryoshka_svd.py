@@ -342,73 +342,78 @@ class MatryoshkaSVDTrainer:
             multiscale_loss = torch.tensor(0.0, device=main_loss_value.device, dtype=main_loss_value.dtype)
             multiscale_count = 0
 
-            # Sample a random fixed rank for auxiliary loss
-            # This encourages the model to work well at all compression levels
-            # MEMORY: Reduce frequency to 20% to save memory
-            if torch.rand(1).item() < 0.2:  # 20% chance (was 50%)
-                # Randomly sample rank from [r_min, r_max]
-                sampled_rank = torch.randint(
-                    self.args.r_min,
-                    self.args.r_max + 1,
-                    (1,),
-                    device=self.device
-                ).item()
+            # IMPROVED: Use stratified sampling to ensure coverage of all rank levels
+            # Train on multiple fixed ranks per batch: r_min, r_max, and 1-2 random intermediate
+            # Frequency increased to 50% for better multi-scale learning
+            if torch.rand(1).item() < 0.5:  # 50% chance (increased from 20%)
+                # CRITICAL: Always include r_min and r_max to ensure boundary performance
+                # Add 1 random intermediate rank for diversity
+                sampled_ranks = [
+                    self.args.r_min,  # Always train at minimum rank
+                    self.args.r_max,  # Always train at maximum rank
+                    torch.randint(self.args.r_min + 1, self.args.r_max, (1,)).item()  # Random mid rank
+                ]
 
-                # Temporarily set all layers to use this fixed rank
-                # by modifying importance to achieve desired rank
-                target_importance = (sampled_rank - self.args.r_min) / (self.args.r_max - self.args.r_min)
+                # Process each sampled rank
+                for sampled_rank in sampled_ranks:
+                    # Temporarily set all layers to use this fixed rank
+                    # by modifying importance to achieve desired rank
+                    target_importance = (sampled_rank - self.args.r_min) / (self.args.r_max - self.args.r_min)
 
-                # Forward pass with fixed rank
-                # We do this by monkey-patching the importance predictor
-                original_forwards = {}
-                for name, module in self.model.named_modules():
-                    if isinstance(module, MatryoshkaSVDLayer):
-                        predictor = module.importance_predictor
-                        original_forwards[name] = predictor.forward
+                    # Forward pass with fixed rank
+                    # We do this by monkey-patching the importance predictor
+                    original_forwards = {}
+                    for name, module in self.model.named_modules():
+                        if isinstance(module, MatryoshkaSVDLayer):
+                            predictor = module.importance_predictor
+                            original_forwards[name] = predictor.forward
 
-                        # Replace forward with fixed importance
-                        def fixed_importance_forward(x, attention_scores=None,
-                                                   target_imp=target_importance):
-                            batch, seq_len = x.shape[0], x.shape[1]
-                            return torch.full((batch, seq_len), target_imp,
-                                            device=x.device, dtype=x.dtype)
+                            # Replace forward with fixed importance
+                            def fixed_importance_forward(x, attention_scores=None,
+                                                       target_imp=target_importance):
+                                batch, seq_len = x.shape[0], x.shape[1]
+                                return torch.full((batch, seq_len), target_imp,
+                                                device=x.device, dtype=x.dtype)
 
-                        predictor.forward = fixed_importance_forward
+                            predictor.forward = fixed_importance_forward
 
-                # CRITICAL: Clear cache before second forward pass
-                torch.cuda.empty_cache()
+                    # CRITICAL: Clear cache before forward pass
+                    torch.cuda.empty_cache()
 
-                # Forward pass with fixed rank
-                outputs_fixed = self.model(input_ids=input_ids, labels=labels)
-                fixed_rank_loss = outputs_fixed.loss.clone()
+                    # Forward pass with fixed rank
+                    outputs_fixed = self.model(input_ids=input_ids, labels=labels)
+                    fixed_rank_loss = outputs_fixed.loss.clone()
 
-                # CRITICAL: Delete outputs immediately
-                del outputs_fixed
-                torch.cuda.empty_cache()
+                    # CRITICAL: Delete outputs immediately
+                    del outputs_fixed
+                    torch.cuda.empty_cache()
 
-                # Restore original forwards
-                for name, module in self.model.named_modules():
-                    if isinstance(module, MatryoshkaSVDLayer):
-                        if name in original_forwards:
-                            module.importance_predictor.forward = original_forwards[name]
+                    # Restore original forwards
+                    for name, module in self.model.named_modules():
+                        if isinstance(module, MatryoshkaSVDLayer):
+                            if name in original_forwards:
+                                module.importance_predictor.forward = original_forwards[name]
 
-                # CRITICAL: Move to same device as multiscale_loss (for multi-GPU)
-                multiscale_loss += fixed_rank_loss.to(multiscale_loss.device)
-                multiscale_count += 1
-                loss_breakdown[f'rank_{sampled_rank}'] = fixed_rank_loss.item()
+                    # CRITICAL: Move to same device as multiscale_loss (for multi-GPU)
+                    multiscale_loss += fixed_rank_loss.to(multiscale_loss.device)
+                    multiscale_count += 1
+                    loss_breakdown[f'rank_{sampled_rank}'] = fixed_rank_loss.item()
 
-                # CRITICAL: Delete intermediate tensors
-                del fixed_rank_loss
+                    # CRITICAL: Delete intermediate tensors
+                    del fixed_rank_loss
 
             # Rank regularization to encourage compression
             rank_reg_loss = self.compute_rank_regularization()
             loss_breakdown['rank_reg'] = rank_reg_loss.item()
 
             # Total loss
-            # Weight: main (1.0) + multiscale (0.3) + rank_reg (as configured)
+            # Weight: main (1.0) + multiscale (avg 0.3 per rank) + rank_reg (as configured)
             # CRITICAL: Move all losses to main_loss_value's device (for multi-GPU)
+            # IMPROVED: Normalize multiscale_loss by count to maintain consistent weighting
             if multiscale_count > 0:
-                total_loss = main_loss_value + 0.3 * multiscale_loss.to(main_loss_value.device) + rank_reg_loss.to(main_loss_value.device)
+                # Average the multiscale loss across all sampled ranks
+                avg_multiscale_loss = multiscale_loss.to(main_loss_value.device) / multiscale_count
+                total_loss = main_loss_value + 0.3 * avg_multiscale_loss + rank_reg_loss.to(main_loss_value.device)
             else:
                 total_loss = main_loss_value + rank_reg_loss.to(main_loss_value.device)
 
