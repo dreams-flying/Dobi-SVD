@@ -481,6 +481,15 @@ class MatryoshkaSVDTrainer:
                     torch.randint(self.args.r_min + 1, self.args.r_max, (1,)).item()  # Random mid rank
                 ]
 
+                # CRITICAL: Define fixed_importance_forward outside loop to avoid closure issues
+                def make_fixed_importance_forward(target_imp):
+                    """Factory function to create fixed importance forward with proper closure."""
+                    def fixed_importance_forward(x, attention_scores=None):
+                        batch, seq_len = x.shape[0], x.shape[1]
+                        return torch.full((batch, seq_len), target_imp,
+                                        device=x.device, dtype=x.dtype)
+                    return fixed_importance_forward
+
                 # Process each sampled rank
                 for sampled_rank in sampled_ranks:
                     # Temporarily set all layers to use this fixed rank
@@ -494,28 +503,22 @@ class MatryoshkaSVDTrainer:
                         if isinstance(module, MatryoshkaSVDLayer):
                             predictor = module.importance_predictor
                             original_forwards[name] = predictor.forward
-
-                            # Replace forward with fixed importance
-                            def fixed_importance_forward(x, attention_scores=None,
-                                                       target_imp=target_importance):
-                                batch, seq_len = x.shape[0], x.shape[1]
-                                return torch.full((batch, seq_len), target_imp,
-                                                device=x.device, dtype=x.dtype)
-
-                            predictor.forward = fixed_importance_forward
+                            # Use factory to create properly scoped function
+                            predictor.forward = make_fixed_importance_forward(target_importance)
 
                     # CRITICAL: Clear cache before forward pass
                     torch.cuda.empty_cache()
 
                     # Forward pass with fixed rank
-                    outputs_fixed = self.model(input_ids=input_ids, labels=labels)
-                    fixed_rank_loss = outputs_fixed.loss.clone()
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        outputs_fixed = self.model(input_ids=input_ids, labels=labels)
+                        fixed_rank_loss = outputs_fixed.loss.clone()
 
                     # CRITICAL: Delete outputs immediately
                     del outputs_fixed
                     torch.cuda.empty_cache()
 
-                    # Restore original forwards
+                    # CRITICAL: Restore original forwards immediately
                     for name, module in self.model.named_modules():
                         if isinstance(module, MatryoshkaSVDLayer):
                             if name in original_forwards:
@@ -625,8 +628,23 @@ class MatryoshkaSVDTrainer:
                     # Unscale gradients for clipping
                     self.scaler.unscale_(self.optimizer)
 
+                # CRITICAL: Check for NaN gradients before clipping
+                nan_detected = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        print(f"WARNING: NaN/Inf gradient detected in {name}")
+                        nan_detected = True
+                        break
+
+                if nan_detected:
+                    print("Skipping optimizer step due to NaN gradients")
+                    self.optimizer.zero_grad()
+                    if self.scaler is not None:
+                        self.scaler.update()
+                    continue
+
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
 
                 # Optimizer step with scaler
                 if self.scaler is not None:

@@ -53,7 +53,8 @@ class MatryoshkaSVDConfig:
     # New features
     learnable_singular_values: bool = False
     activation_aware_init: bool = False
-    spectral_regularization_weight: float = 0.0001
+    # CRITICAL: Reduced from 0.0001 to allow S to learn while maintaining stability
+    spectral_regularization_weight: float = 0.00001
 
     # Auto rank range
     auto_rank_range: bool = False
@@ -148,7 +149,9 @@ class AdaptiveRankPredictor(nn.Module):
             batch_mean = importance.mean()
             batch_std = importance.std() + 1e-6
 
-            momentum = 0.1
+            # CRITICAL: Use smaller momentum for more stable running average
+            # 0.01 gives ~100-batch averaging, more stable than 0.1 (10-batch)
+            momentum = 0.01
             self.running_mean = (1 - momentum) * self.running_mean + momentum * batch_mean
             self.running_std = (1 - momentum) * self.running_std + momentum * batch_std
             self.num_batches_tracked += 1
@@ -283,9 +286,13 @@ class MatryoshkaSVDLayer(nn.Module):
         # Singular values: learnable or fixed
         if self.config.learnable_singular_values:
             # Log-space parameterization for positivity and stability
-            self.log_S = nn.Parameter(torch.log(S.clamp(min=1e-6)).to(self.device))
+            # CRITICAL: Clamp S before taking log to avoid log(0) and ensure reasonable range
+            S_clamped = S.clamp(min=1e-6, max=1e3)  # Prevent extreme values
+            log_S_init = torch.log(S_clamped).clamp(min=-10.0, max=7.0)  # log(S) in reasonable range
+            self.log_S = nn.Parameter(log_S_init.to(self.device))
             self.register_buffer('S_init', S.to(self.device))  # Keep for regularization
             print(f"  Using learnable singular values (log-parameterized)")
+            print(f"    Initial log_S range: [{log_S_init.min():.2f}, {log_S_init.max():.2f}]")
         else:
             self.register_buffer('S', S.to(self.device))
 
@@ -335,9 +342,12 @@ class MatryoshkaSVDLayer(nn.Module):
 
     @property
     def S(self) -> torch.Tensor:
-        """Get singular values (learnable or fixed)."""
+        """Get singular values (learnable or fixed) with numerical stability."""
         if self.config.learnable_singular_values:
-            return torch.exp(self.log_S)
+            # CRITICAL: Clamp log_S to prevent exp explosion
+            # log_S in [-20, 10] => S in [2e-9, 22026]
+            log_S_clamped = torch.clamp(self.log_S, min=-20.0, max=10.0)
+            return torch.exp(log_S_clamped)
         else:
             return self._buffers['S']
 
@@ -422,7 +432,7 @@ class MatryoshkaSVDLayer(nn.Module):
         calibration_data: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Activation-aware SVD (借鉴 Dobi-SVD).
+        Activation-aware SVD (借鉴 Dobi-SVD) with numerical stability fixes.
 
         This reweights the SVD to prioritize directions important for actual data.
         Mathematically: SVD of W @ C^{1/2} where C = X^T X / n
@@ -431,34 +441,73 @@ class MatryoshkaSVDLayer(nn.Module):
 
         X = calibration_data  # [num_samples, input_size]
 
-        # Compute input covariance matrix
-        cov = X.T @ X / X.shape[0]  # [input_size, input_size]
+        # CRITICAL: Normalize X for numerical stability
+        X_mean = X.mean(dim=0, keepdim=True)
+        X_std = X.std(dim=0, keepdim=True) + 1e-8
+        X_normalized = (X - X_mean) / X_std
 
-        # Add regularization for numerical stability
-        cov = cov + 1e-4 * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+        # Compute input covariance matrix on normalized data
+        cov = X_normalized.T @ X_normalized / X_normalized.shape[0]  # [input_size, input_size]
+
+        # CRITICAL: Stronger regularization for large matrices
+        reg_strength = max(1e-4, 1e-6 * cov.shape[0])  # Scale with dimension
+        cov = cov + reg_strength * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
 
         # Eigendecomposition of covariance
         print(f"  Computing eigendecomposition of covariance matrix...")
-        eigvals, eigvecs = torch.linalg.eigh(cov)
-        eigvals = eigvals.clamp(min=1e-6)
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(cov)
+        except RuntimeError as e:
+            print(f"  ⚠️  Eigendecomposition failed: {e}, falling back to standard SVD")
+            return self._standard_svd(weight)
 
-        # Compute C^{1/2}
-        C_sqrt = eigvecs @ torch.diag(eigvals.sqrt()) @ eigvecs.T
+        # CRITICAL: Clamp eigenvalues and filter out tiny ones
+        eigvals = eigvals.clamp(min=1e-6)
+        valid_mask = eigvals > 1e-4  # Filter out very small eigenvalues
+        eigvals = eigvals[valid_mask]
+        eigvecs = eigvecs[:, valid_mask]
+
+        print(f"  Kept {eigvals.shape[0]} / {cov.shape[0]} eigenvalues (filtered tiny ones)")
+
+        # Compute C^{1/2} with numerical safety
+        eigvals_sqrt = eigvals.sqrt()
+        C_sqrt = eigvecs @ torch.diag(eigvals_sqrt) @ eigvecs.T
+
+        # CRITICAL: Clip C_sqrt to prevent numerical explosion
+        C_sqrt = torch.clamp(C_sqrt, -10.0, 10.0)
 
         # Weight the matrix: W_weighted = W @ C^{1/2}
         print(f"  Computing weighted matrix W @ C^{{1/2}}...")
         W_weighted = weight @ C_sqrt
 
+        # Check for NaN/Inf
+        if not torch.isfinite(W_weighted).all():
+            print(f"  ⚠️  W_weighted contains NaN/Inf, falling back to standard SVD")
+            return self._standard_svd(weight)
+
         # SVD of weighted matrix
         print(f"  Computing SVD of weighted matrix...")
-        U, S, Vh = torch.linalg.svd(W_weighted, full_matrices=False)
+        try:
+            U, S, Vh = torch.linalg.svd(W_weighted, full_matrices=False)
+        except RuntimeError as e:
+            print(f"  ⚠️  SVD failed: {e}, falling back to standard SVD")
+            return self._standard_svd(weight)
 
-        # Transform V back: V_original = C^{-1/2} @ V_weighted^T
-        C_sqrt_inv = eigvecs @ torch.diag(1.0 / eigvals.sqrt()) @ eigvecs.T
+        # Transform V back: V_original = V_weighted @ C^{-1/2}
+        # CRITICAL: Use safe division
+        eigvals_sqrt_inv = 1.0 / (eigvals_sqrt + 1e-8)  # Add epsilon before division
+        C_sqrt_inv = eigvecs @ torch.diag(eigvals_sqrt_inv) @ eigvecs.T
+
         V = Vh[:self.r_max, :] @ C_sqrt_inv.T
 
         # Re-normalize V rows to unit norm
-        V = V / (V.norm(dim=1, keepdim=True) + 1e-6)
+        V_norm = V.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        V = V / V_norm
+
+        # Final safety check
+        if not torch.isfinite(V).all():
+            print(f"  ⚠️  V contains NaN/Inf, falling back to standard SVD")
+            return self._standard_svd(weight)
 
         U = U[:, :self.r_max]
         S = S[:self.r_max]
@@ -650,6 +699,12 @@ class MatryoshkaSVDLayer(nn.Module):
         Returns:
             output: [batch, seq_len, output_size]
         """
+        # CRITICAL: Check for NaN/Inf in inputs
+        if not torch.isfinite(x).all():
+            raise ValueError(f"NaN/Inf detected in input x at {self.name}")
+        if not torch.isfinite(S).all():
+            raise ValueError(f"NaN/Inf detected in singular values S at {self.name}")
+
         # Compute soft truncation weights
         truncation = self.compute_soft_truncation(adaptive_rank)  # [batch, seq, r_max]
 
@@ -669,6 +724,10 @@ class MatryoshkaSVDLayer(nn.Module):
 
         # @ U^T -> [batch, seq, output_size]
         output = torch.matmul(xVS, U.T)
+
+        # CRITICAL: Check for NaN/Inf in output
+        if not torch.isfinite(output).all():
+            raise ValueError(f"NaN/Inf detected in output at {self.name}")
 
         return output
 
@@ -694,6 +753,12 @@ class MatryoshkaSVDLayer(nn.Module):
         Returns:
             output: [batch, seq_len, output_size]
         """
+        # CRITICAL: Check for NaN/Inf in inputs
+        if not torch.isfinite(x).all():
+            raise ValueError(f"NaN/Inf detected in input x at {self.name}")
+        if not torch.isfinite(S).all():
+            raise ValueError(f"NaN/Inf detected in singular values S at {self.name}")
+
         batch_size, seq_len, _ = x.shape
         output = torch.zeros(batch_size, seq_len, self.output_size, device=x.device, dtype=dtype)
 
@@ -739,6 +804,10 @@ class MatryoshkaSVDLayer(nn.Module):
             # Put back
             output_flat = output.view(-1, self.output_size)
             output_flat[flat_mask] = out_bucket
+
+        # CRITICAL: Check for NaN/Inf in output
+        if not torch.isfinite(output).all():
+            raise ValueError(f"NaN/Inf detected in bucketed output at {self.name}")
 
         return output
 
