@@ -146,6 +146,13 @@ class DobiMatryoshkaSVDLayer(nn.Module):
             # Normal mode: use learnable gamma, clamped to [r_min, r_max]
             real_gamma = self.gamma.clamp(self.r_min, self.r_max)
 
+            # Protection against NaN/Inf in gamma (can happen during training)
+            if torch.isnan(real_gamma).any() or torch.isinf(real_gamma).any():
+                print(f"Warning: gamma became NaN/Inf, resetting to {(self.r_min + self.r_max) / 2}")
+                # Reset gamma to middle of range
+                self.gamma.data.fill_((self.r_min + self.r_max) / 2.0)
+                real_gamma = self.gamma.clamp(self.r_min, self.r_max)
+
         # === STEP 3: Dynamic SVD (from Dobi-SVD) ===
         # Add buffer for safer SVD computation
         gamma_range = int(real_gamma.detach()) + 5
@@ -172,8 +179,10 @@ class DobiMatryoshkaSVDLayer(nn.Module):
             # 3. Add small noise for regularization (Tikhonov-like)
             # This prevents ill-conditioned matrices during gradient checkpointing
             # The noise is small relative to the signal
-            eps = 1e-6 * x.abs().mean()
-            x = x + eps * torch.randn_like(x)
+            # IMPORTANT: Detach noise so gradients don't flow through it
+            eps = 1e-6 * x.abs().mean().detach()
+            noise = eps * torch.randn_like(x)
+            x = x + noise.detach()  # Don't backprop through noise
 
             # 4. Perform SVD with error handling
             try:
@@ -182,8 +191,9 @@ class DobiMatryoshkaSVDLayer(nn.Module):
                 if "failed to converge" in str(e) or "ill-conditioned" in str(e):
                     # Fallback: Add stronger noise and retry
                     print(f"Warning: SVD failed to converge, adding stronger regularization...")
-                    eps_strong = 1e-4 * x.abs().mean()
-                    x = x + eps_strong * torch.randn_like(x)
+                    eps_strong = 1e-4 * x.abs().mean().detach()
+                    strong_noise = eps_strong * torch.randn_like(x)
+                    x = x + strong_noise.detach()  # Don't backprop through noise
                     U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
                 else:
                     raise
