@@ -104,19 +104,19 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         Returns:
             Output tensor with same shape as x
         """
-        # Store original dtype for final output
+        # Store original dtype and shape
         input_dtype = x.dtype
+        original_shape = x.shape
 
         # === STEP 1: Apply original weight (from Dobi-SVD) ===
-        # CRITICAL: SVD requires FP32, so convert input first
-        x = x.to(computeSVD_dtype)
+        # Keep in original dtype (FP16) to avoid dtype mismatch
         x = self.ori(x)
 
-        # Ensure FP32 and contiguous for SVD
+        # === STEP 2: Convert to FP32 for SVD ===
+        # CRITICAL: SVD requires FP32
         x = x.to(computeSVD_dtype).contiguous()
 
         # Handle 3D inputs: [batch, seq, hidden] -> [batch*seq, hidden]
-        original_shape = x.shape
         if x.dim() == 3:
             batch_size, seq_len, hidden_size = x.shape
             x = x.reshape(batch_size * seq_len, hidden_size)
