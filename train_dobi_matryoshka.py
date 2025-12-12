@@ -38,6 +38,7 @@ from utils.datautils import prepare_train_loaders
 class DobiMatryoshkaTrainer(Trainer):
     """
     Custom Trainer that combines Dobi-SVD compression loss with Matryoshka multi-scale training.
+    Includes gamma parameter protection to prevent NaN/Inf.
     """
 
     def __init__(self, *args, r_max=256, r_min=64, lambda_reg=0.001, multiscale_frequency=0.5, **kwargs):
@@ -46,6 +47,32 @@ class DobiMatryoshkaTrainer(Trainer):
         self.r_min = r_min
         self.lambda_reg = lambda_reg
         self.multiscale_frequency = multiscale_frequency
+
+    def training_step(self, model, inputs):
+        """
+        Override training_step to add gamma parameter protection.
+        """
+        # Perform normal training step
+        loss = super().training_step(model, inputs)
+
+        # After optimizer step, clip gamma parameters to prevent NaN/Inf
+        # This is critical for numerical stability
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, DobiMatryoshkaSVDLayer):
+                    # Clip gamma to valid range
+                    module.gamma.data.clamp_(module.r_min, module.r_max)
+
+                    # Check for NaN/Inf and reset if needed
+                    if torch.isnan(module.gamma).any() or torch.isinf(module.gamma).any():
+                        print(f"Critical: Detected NaN/Inf in gamma after optimizer step, resetting...")
+                        module.gamma.data.fill_((module.r_min + module.r_max) / 2.0)
+
+                    # Clip gamma gradients to prevent explosion
+                    if module.gamma.grad is not None:
+                        torch.nn.utils.clip_grad_norm_([module.gamma], max_norm=1.0)
+
+        return loss
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """

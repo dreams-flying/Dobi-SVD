@@ -176,25 +176,35 @@ class DobiMatryoshkaSVDLayer(nn.Module):
             else:
                 x_scale = 1.0
 
-            # 3. Add small noise for regularization (Tikhonov-like)
-            # This prevents ill-conditioned matrices during gradient checkpointing
-            # The noise is small relative to the signal
-            # IMPORTANT: Detach noise so gradients don't flow through it
-            eps = 1e-6 * x.abs().mean().detach()
-            noise = eps * torch.randn_like(x)
-            x = x + noise.detach()  # Don't backprop through noise
+            # 3. Add deterministic regularization (better than random noise)
+            # Use a small diagonal term instead of random noise
+            # This is more stable and doesn't introduce randomness
+            eps = 1e-7 * x.abs().mean().detach()
+            # Add to diagonal for better conditioning (Tikhonov regularization)
+            min_dim = min(x.shape[0], x.shape[1])
+            x.view(-1)[:min_dim * (x.shape[1] + 1):x.shape[1] + 1] += eps
 
             # 4. Perform SVD with error handling
             try:
                 U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+
+                # Check if SVD produced valid output
+                if torch.isnan(S).any() or torch.isinf(S).any():
+                    print(f"Warning: SVD produced NaN/Inf in singular values")
+                    # Replace invalid values
+                    S = torch.nan_to_num(S, nan=0.0, posinf=1e4, neginf=0.0)
+
             except RuntimeError as e:
                 if "failed to converge" in str(e) or "ill-conditioned" in str(e):
-                    # Fallback: Add stronger noise and retry
+                    # Fallback: Add stronger diagonal regularization and retry
                     print(f"Warning: SVD failed to converge, adding stronger regularization...")
-                    eps_strong = 1e-4 * x.abs().mean().detach()
-                    strong_noise = eps_strong * torch.randn_like(x)
-                    x = x + strong_noise.detach()  # Don't backprop through noise
+                    eps_strong = 1e-5 * x.abs().mean().detach()
+                    x.view(-1)[:min_dim * (x.shape[1] + 1):x.shape[1] + 1] += eps_strong
                     U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+
+                    # Check output again
+                    if torch.isnan(S).any() or torch.isinf(S).any():
+                        S = torch.nan_to_num(S, nan=0.0, posinf=1e4, neginf=0.0)
                 else:
                     raise
 
@@ -221,6 +231,11 @@ class DobiMatryoshkaSVDLayer(nn.Module):
 
         x_transformed = torch.matmul(US, V.T)  # [m, k] @ [k, n] = [m, n]
         del US, V  # Free intermediate tensors
+
+        # Check for NaN/Inf in output before returning
+        if torch.isnan(x_transformed).any() or torch.isinf(x_transformed).any():
+            print(f"Warning: Output contains NaN/Inf, applying correction...")
+            x_transformed = torch.nan_to_num(x_transformed, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # Reshape back to original shape if needed
         if needs_reshape:
