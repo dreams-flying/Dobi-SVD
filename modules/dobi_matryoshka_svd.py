@@ -104,8 +104,16 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         Returns:
             Output tensor with same shape as x
         """
+        # Store original dtype for final output
+        input_dtype = x.dtype
+
         # === STEP 1: Apply original weight (from Dobi-SVD) ===
-        x = self.ori(x).to(computeSVD_dtype)
+        # CRITICAL: SVD requires FP32, so convert input first
+        x = x.to(computeSVD_dtype)
+        x = self.ori(x)
+
+        # Ensure FP32 and contiguous for SVD
+        x = x.to(computeSVD_dtype).contiguous()
 
         # Handle 3D inputs: [batch, seq, hidden] -> [batch*seq, hidden]
         original_shape = x.shape
@@ -154,14 +162,14 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         S_diag = torch.diag_embed(S_transformed)
         x_transformed = torch.matmul(torch.matmul(U, S_diag), V.T)
 
-        # Convert back to model dtype
-        real_x = x_transformed.to(model_load_dtype)
-
         # Reshape back to original shape if needed
         if needs_reshape:
-            real_x = real_x.reshape(batch_size, seq_len, -1)
+            x_transformed = x_transformed.reshape(batch_size, seq_len, -1)
 
-        return real_x
+        # Convert back to input dtype (usually FP16 for model efficiency)
+        output = x_transformed.to(input_dtype)
+
+        return output
 
     def get_compression_loss(self) -> torch.Tensor:
         """
