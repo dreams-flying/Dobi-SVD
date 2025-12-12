@@ -107,14 +107,17 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         # === STEP 1: Apply original weight (from Dobi-SVD) ===
         x = self.ori(x).to(computeSVD_dtype)
 
-        # Handle batch dimensions
+        # Handle 3D inputs: [batch, seq, hidden] -> [batch*seq, hidden]
+        original_shape = x.shape
         if x.dim() == 3:
-            x = x.squeeze(0)
-            squeeze_need = True
+            batch_size, seq_len, hidden_size = x.shape
+            x = x.reshape(batch_size * seq_len, hidden_size)
+            needs_reshape = True
+        elif x.dim() == 2:
+            needs_reshape = False
         else:
-            squeeze_need = False
+            raise ValueError(f"Expected 2D or 3D tensor, got {x.dim()}D")
 
-        assert x.dim() == 2, f"Expected 2D tensor, got {x.dim()}D"
         m, n = x.shape
         full_rank = min(m, n)
 
@@ -154,8 +157,9 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         # Convert back to model dtype
         real_x = x_transformed.to(model_load_dtype)
 
-        if squeeze_need:
-            real_x = real_x.unsqueeze(0)
+        # Reshape back to original shape if needed
+        if needs_reshape:
+            real_x = real_x.reshape(batch_size, seq_len, -1)
 
         return real_x
 
