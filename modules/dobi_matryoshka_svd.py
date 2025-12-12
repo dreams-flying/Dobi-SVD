@@ -219,9 +219,23 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         sequence = torch.arange(1, len(S) + 1, device=S.device, dtype=computeSVD_dtype)
 
         # Tanh-based soft truncation
-        Trunc = 0.5 * torch.tanh(self.beta * (real_gamma - sequence)) + 0.5
+        # CRITICAL: Clip input to tanh to prevent numerical issues
+        # tanh saturates at ±20, so clip to prevent overflow in gradients
+        tanh_input = self.beta * (real_gamma - sequence)
+        tanh_input = torch.clamp(tanh_input, min=-20.0, max=20.0)
+        Trunc = 0.5 * torch.tanh(tanh_input) + 0.5
+
+        # Ensure Trunc is in valid range [0, 1]
+        Trunc = torch.clamp(Trunc, min=0.0, max=1.0)
+
         S_transformed = S * Trunc
-        del S, Trunc, sequence  # Free intermediate tensors
+
+        # Check for NaN/Inf in transformed singular values
+        if torch.isnan(S_transformed).any() or torch.isinf(S_transformed).any():
+            print(f"Warning: S_transformed contains NaN/Inf, using S directly")
+            S_transformed = S.clamp(min=0.0, max=1e4)
+
+        del S, Trunc, sequence, tanh_input  # Free intermediate tensors
 
         # === STEP 5: Reconstruct ===
         # Memory-efficient reconstruction: U @ diag(S) @ V^T
