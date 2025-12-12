@@ -109,7 +109,8 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         original_shape = x.shape
 
         # === STEP 1: Apply original weight (from Dobi-SVD) ===
-        # Keep in original dtype (FP16) to avoid dtype mismatch
+        # Ensure input matches weight dtype to avoid mismatch
+        x = x.to(self.ori.weight.dtype)
         x = self.ori(x)
 
         # === STEP 2: Convert to FP32 for SVD ===
