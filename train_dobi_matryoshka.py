@@ -120,7 +120,7 @@ def main():
 
     # Matryoshka arguments
     parser.add_argument('--multiscale_frequency', type=float, default=0.5,
-                       help='Frequency of multi-scale training (0.5 = 50%)')
+                       help='Frequency of multi-scale training (0.5 = 50%%)')
 
     # Dobi-SVD regularization
     parser.add_argument('--lambda_reg', type=float, default=0.001,
