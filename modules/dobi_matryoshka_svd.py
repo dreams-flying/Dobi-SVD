@@ -133,16 +133,17 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         # === STEP 2: Determine rank to use ===
         if fixed_rank is not None:
             # Multi-scale training mode
-            real_gamma = fixed_rank
+            real_gamma = torch.tensor(fixed_rank, dtype=computeSVD_dtype, device=x.device)
         elif self.fixed_rank_override is not None:
             # Temporary override (alternative multi-scale approach)
-            real_gamma = self.fixed_rank_override
+            real_gamma = torch.tensor(self.fixed_rank_override, dtype=computeSVD_dtype, device=x.device)
         else:
             # Normal mode: use learnable gamma, clamped to [r_min, r_max]
             real_gamma = self.gamma.clamp(self.r_min, self.r_max)
 
         # === STEP 3: Dynamic SVD (from Dobi-SVD) ===
         # Add buffer for safer SVD computation
+        # real_gamma is always a tensor now
         gamma_range = int(real_gamma.detach()) + 5
         gamma_range = min(full_rank, max(1, gamma_range))
 
