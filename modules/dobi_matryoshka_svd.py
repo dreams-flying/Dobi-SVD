@@ -153,7 +153,44 @@ class DobiMatryoshkaSVDLayer(nn.Module):
 
         # CRITICAL: Disable autocast for SVD computation
         with torch.cuda.amp.autocast(enabled=False):
-            U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+            # === Numerical stability measures ===
+            # Critical for gradient checkpointing + mixed precision
+
+            # 1. Check for NaN/Inf values
+            has_nan_inf = torch.isnan(x).any() or torch.isinf(x).any()
+            if has_nan_inf:
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
+            # 2. Scale to reasonable range to prevent overflow/underflow
+            # This is critical for numerical stability
+            x_scale = x.abs().max().clamp(min=1e-8)
+            if x_scale > 1e3 or x_scale < 1e-3:
+                x = x / x_scale
+            else:
+                x_scale = 1.0
+
+            # 3. Add small noise for regularization (Tikhonov-like)
+            # This prevents ill-conditioned matrices during gradient checkpointing
+            # The noise is small relative to the signal
+            eps = 1e-6 * x.abs().mean()
+            x = x + eps * torch.randn_like(x)
+
+            # 4. Perform SVD with error handling
+            try:
+                U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+            except RuntimeError as e:
+                if "failed to converge" in str(e) or "ill-conditioned" in str(e):
+                    # Fallback: Add stronger noise and retry
+                    print(f"Warning: SVD failed to converge, adding stronger regularization...")
+                    eps_strong = 1e-4 * x.abs().mean()
+                    x = x + eps_strong * torch.randn_like(x)
+                    U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+                else:
+                    raise
+
+            # 5. Restore original scale if we scaled the input
+            if x_scale != 1.0:
+                S = S * x_scale
 
         # Free x to save memory (no longer needed after SVD)
         del x
