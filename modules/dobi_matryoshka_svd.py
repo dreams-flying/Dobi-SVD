@@ -96,6 +96,7 @@ class DobiMatryoshkaSVDLayer(nn.Module):
     def forward(self, x: torch.Tensor, fixed_rank: Optional[float] = None) -> torch.Tensor:
         """
         Forward pass with dynamic SVD (from Dobi-SVD).
+        Optimized for memory efficiency.
 
         Args:
             x: Input tensor [batch, seq, input_size] or [batch*seq, input_size]
@@ -109,22 +110,26 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         original_shape = x.shape
 
         # === STEP 1: Apply original weight (from Dobi-SVD) ===
-        # Ensure input matches weight dtype to avoid mismatch
-        x = x.to(self.ori.weight.dtype)
+        # Only convert if dtype doesn't match (avoid unnecessary copy)
+        if x.dtype != self.ori.weight.dtype:
+            x = x.to(self.ori.weight.dtype)
         x = self.ori(x)
 
         # === STEP 2: Convert to FP32 for SVD ===
-        # CRITICAL: SVD requires FP32
-        x = x.to(computeSVD_dtype).contiguous()
+        # Only convert if needed (avoid unnecessary copy)
+        if x.dtype != computeSVD_dtype:
+            x = x.to(computeSVD_dtype)
+        # Only call contiguous if not already contiguous
+        if not x.is_contiguous():
+            x = x.contiguous()
 
         # Handle 3D inputs: [batch, seq, hidden] -> [batch*seq, hidden]
+        needs_reshape = False
         if x.dim() == 3:
             batch_size, seq_len, hidden_size = x.shape
             x = x.reshape(batch_size * seq_len, hidden_size)
             needs_reshape = True
-        elif x.dim() == 2:
-            needs_reshape = False
-        else:
+        elif x.dim() != 2:
             raise ValueError(f"Expected 2D or 3D tensor, got {x.dim()}D")
 
         m, n = x.shape
@@ -143,31 +148,32 @@ class DobiMatryoshkaSVDLayer(nn.Module):
 
         # === STEP 3: Dynamic SVD (from Dobi-SVD) ===
         # Add buffer for safer SVD computation
-        # real_gamma is always a tensor now
         gamma_range = int(real_gamma.detach()) + 5
         gamma_range = min(full_rank, max(1, gamma_range))
 
         # CRITICAL: Disable autocast for SVD computation
-        # autocast forces FP16 but SVD requires FP32
         with torch.cuda.amp.autocast(enabled=False):
-            # Ensure x is truly FP32 (autocast might have changed it)
-            x = x.to(torch.float32)
             U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
 
-        # === STEP 4: Soft truncation (from Dobi-SVD) ===
-        sequence = torch.arange(1, len(S) + 1, device=x.device, dtype=computeSVD_dtype)
+        # Free x to save memory (no longer needed after SVD)
+        del x
 
-        # Tanh-based soft truncation (smoother than sigmoid)
-        # Trunc = 0.5 * tanh(beta * (gamma - k)) + 0.5
-        # - At k = gamma: Trunc = 0.5
-        # - At k < gamma: Trunc → 1
-        # - At k > gamma: Trunc → 0
+        # === STEP 4: Soft truncation (from Dobi-SVD) ===
+        sequence = torch.arange(1, len(S) + 1, device=S.device, dtype=computeSVD_dtype)
+
+        # Tanh-based soft truncation
         Trunc = 0.5 * torch.tanh(self.beta * (real_gamma - sequence)) + 0.5
         S_transformed = S * Trunc
+        del S, Trunc, sequence  # Free intermediate tensors
 
         # === STEP 5: Reconstruct ===
-        S_diag = torch.diag_embed(S_transformed)
-        x_transformed = torch.matmul(torch.matmul(U, S_diag), V.T)
+        # Memory-efficient reconstruction: U @ diag(S) @ V^T
+        # Instead of creating S_diag matrix, use broadcasting
+        US = U * S_transformed.unsqueeze(0)  # Broadcasting: [m, k] * [1, k] = [m, k]
+        del U, S_transformed  # Free U and S after use
+
+        x_transformed = torch.matmul(US, V.T)  # [m, k] @ [k, n] = [m, n]
+        del US, V  # Free intermediate tensors
 
         # Reshape back to original shape if needed
         if needs_reshape:

@@ -157,9 +157,14 @@ def main():
 
     # Load model and tokenizer
     print("\nLoading model...")
+    # Load model in FP32 for proper mixed precision training
+    # Mixed precision training requires:
+    # - Parameters in FP32 (for gradient accumulation)
+    # - Forward pass in FP16 (via autocast, controlled by Trainer)
+    # - Gradients in FP32 (for stability)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,  # FP32 for parameters
         device_map=None,
         low_cpu_mem_usage=True
     )
