@@ -86,14 +86,21 @@ class DobiMatryoshkaTrainer:
         print("Preparing datasets")
         print("="*80)
 
+        # Setup cache directories (from Dobi-SVD)
+        from pathlib import Path
+        path_head_folder = Path(args.path_head_folder)
+        data_cache_dir = path_head_folder / "data_cache"
+        dataset_cache_dir = path_head_folder / "dataset_cache"
+        data_cache_dir.mkdir(parents=True, exist_ok=True)
+        dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Call with Dobi-SVD signature
         self.train_loader, self.val_loader = prepare_train_loaders(
-            dataset_name=args.dataset,
             tokenizer=self.tokenizer,
-            seqlen=args.seq_len,
-            nsamples_train=args.n_train_samples,
-            nsamples_val=args.n_eval_samples,
-            seed=args.seed,
-            batch_size=args.batch_size
+            DATASET_NAME=args.dataset,
+            data_cache_dir=data_cache_dir,
+            dataset_cache_dir=dataset_cache_dir,
+            args=args
         )
 
         print(f"Train samples: {args.n_train_samples}")
@@ -384,6 +391,11 @@ def main():
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--output_dir', type=str, default='./output_dobi_matryoshka')
     parser.add_argument('--save_model', action='store_true')
+
+    # Dobi-SVD data arguments
+    parser.add_argument('--path_head_folder', type=str, default='./')
+    parser.add_argument('--SAVE', action='store_true', default=False)
+    parser.add_argument('--RECREATE', action='store_true', default=False)
 
     args = parser.parse_args()
 
