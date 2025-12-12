@@ -50,27 +50,29 @@ class DobiMatryoshkaTrainer(Trainer):
 
     def training_step(self, model, inputs):
         """
-        Override training_step to add gamma parameter protection.
+        Override training_step to add post-optimizer gamma validation.
+
+        Note: Gradient clipping is handled by gradient hooks in the layer itself,
+        which run during backward pass before optimizer step.
+        This method just validates gamma after optimizer update.
         """
-        # Perform normal training step
+        # Perform normal training step (includes forward, backward, optimizer step)
         loss = super().training_step(model, inputs)
 
-        # After optimizer step, clip gamma parameters to prevent NaN/Inf
-        # This is critical for numerical stability
+        # Post-optimizer validation: ensure gamma stays in valid range
+        # This is a safety net - gradient hooks should prevent issues
         with torch.no_grad():
             for module in model.modules():
                 if isinstance(module, DobiMatryoshkaSVDLayer):
-                    # Clip gamma to valid range
+                    # Clamp gamma to valid range [r_min, r_max]
                     module.gamma.data.clamp_(module.r_min, module.r_max)
 
-                    # Check for NaN/Inf and reset if needed
+                    # Emergency check for NaN/Inf (should be very rare with hooks)
                     if torch.isnan(module.gamma).any() or torch.isinf(module.gamma).any():
-                        print(f"Critical: Detected NaN/Inf in gamma after optimizer step, resetting...")
+                        print(f"EMERGENCY: Detected NaN/Inf in gamma after optimizer step")
+                        print(f"  Layer: {module.name if hasattr(module, 'name') and module.name else 'unknown'}")
+                        print(f"  Resetting to midpoint: {(module.r_min + module.r_max) / 2.0}")
                         module.gamma.data.fill_((module.r_min + module.r_max) / 2.0)
-
-                    # Clip gamma gradients to prevent explosion
-                    if module.gamma.grad is not None:
-                        torch.nn.utils.clip_grad_norm_([module.gamma], max_norm=1.0)
 
         return loss
 

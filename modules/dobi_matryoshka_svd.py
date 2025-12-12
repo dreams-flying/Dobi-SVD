@@ -70,6 +70,23 @@ class DobiMatryoshkaSVDLayer(nn.Module):
             requires_grad=True
         )
 
+        # CRITICAL: Add gradient hook to clip gamma gradients immediately after backward
+        # This prevents gamma from becoming NaN/Inf due to gradient explosion
+        # Hook is called during backward pass, before optimizer step
+        def gamma_grad_hook(grad):
+            """Clip gamma gradients aggressively to prevent NaN/Inf."""
+            if grad is None:
+                return grad
+            # Very aggressive clipping (max_norm=0.1)
+            grad_norm = grad.norm()
+            if grad_norm > 0.1:
+                grad = grad * (0.1 / grad_norm)
+            # Also clip to prevent any NaN/Inf in gradients themselves
+            grad = torch.nan_to_num(grad, nan=0.0, posinf=0.1, neginf=-0.1)
+            return grad
+
+        self.gamma.register_hook(gamma_grad_hook)
+
         # === CORE: Preserve original weight (from Dobi-SVD) ===
         input_size = weight.size(1)
         output_size = weight.size(0)
@@ -144,14 +161,23 @@ class DobiMatryoshkaSVDLayer(nn.Module):
             real_gamma = torch.tensor(self.fixed_rank_override, dtype=computeSVD_dtype, device=x.device)
         else:
             # Normal mode: use learnable gamma, clamped to [r_min, r_max]
+            # CRITICAL: First check if gamma itself is corrupted (safety net)
+            # With gradient hooks, this should rarely trigger
+            if torch.isnan(self.gamma).any() or torch.isinf(self.gamma).any():
+                # Emergency reset - this should not happen with gradient hooks
+                print(f"CRITICAL: gamma corrupted before forward pass, emergency reset")
+                self.gamma.data.fill_((self.r_min + self.r_max) / 2.0)
+
             real_gamma = self.gamma.clamp(self.r_min, self.r_max)
 
-            # Protection against NaN/Inf in gamma (can happen during training)
+            # Double-check after clamp (paranoid safety check)
             if torch.isnan(real_gamma).any() or torch.isinf(real_gamma).any():
-                print(f"Warning: gamma became NaN/Inf, resetting to {(self.r_min + self.r_max) / 2}")
-                # Reset gamma to middle of range
-                self.gamma.data.fill_((self.r_min + self.r_max) / 2.0)
-                real_gamma = self.gamma.clamp(self.r_min, self.r_max)
+                print(f"CRITICAL: real_gamma corrupted after clamp, using fallback")
+                # Use detached constant to prevent gradient flow through corrupted path
+                real_gamma = torch.tensor((self.r_min + self.r_max) / 2.0,
+                                         dtype=computeSVD_dtype,
+                                         device=x.device,
+                                         requires_grad=False)
 
         # === STEP 3: Dynamic SVD (from Dobi-SVD) ===
         # Add buffer for safer SVD computation
