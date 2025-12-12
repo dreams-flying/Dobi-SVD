@@ -145,7 +145,12 @@ class DobiMatryoshkaSVDLayer(nn.Module):
         gamma_range = int(real_gamma.detach()) + 5
         gamma_range = min(full_rank, max(1, gamma_range))
 
-        U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
+        # CRITICAL: Disable autocast for SVD computation
+        # autocast forces FP16 but SVD requires FP32
+        with torch.cuda.amp.autocast(enabled=False):
+            # Ensure x is truly FP32 (autocast might have changed it)
+            x = x.to(torch.float32)
+            U, S, V = stable_lowrank_SVD.apply(x, gamma_range)
 
         # === STEP 4: Soft truncation (from Dobi-SVD) ===
         sequence = torch.arange(1, len(S) + 1, device=x.device, dtype=computeSVD_dtype)
