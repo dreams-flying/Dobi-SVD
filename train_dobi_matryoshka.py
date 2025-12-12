@@ -157,17 +157,25 @@ def main():
 
     # Load model and tokenizer
     print("\nLoading model...")
-    # Load model in FP32 for proper mixed precision training
-    # Mixed precision training requires:
-    # - Parameters in FP32 (for gradient accumulation)
-    # - Forward pass in FP16 (via autocast, controlled by Trainer)
-    # - Gradients in FP32 (for stability)
+    # Load model with memory optimization
+    # Strategy: Load in FP16 to save memory, use gradient checkpointing
+    # Trainer will handle FP32 master weights internally
+    print("\nLoading model with memory optimization...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float32,  # FP32 for parameters
+        torch_dtype=torch.float16,  # FP16 to save memory (~14GB vs ~28GB)
         device_map=None,
         low_cpu_mem_usage=True
     )
+
+    # Enable gradient checkpointing to save activation memory
+    # This trades computation for memory (recomputes activations during backward)
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        print("✓ Gradient checkpointing enabled (saves activation memory)")
+
+    # Move to GPU
+    model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -223,6 +231,19 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Configure mixed precision training
+    # BF16 is preferred over FP16 as it doesn't require gradient scaling
+    # and works better with custom layers
+    use_bf16 = torch.cuda.is_bf16_supported() if args.use_fp16 else False
+    use_fp16 = args.use_fp16 and not use_bf16
+
+    if use_bf16:
+        print("✓ Using BF16 mixed precision (no gradient scaling needed)")
+    elif use_fp16:
+        print("✓ Using FP16 mixed precision (with gradient scaling)")
+    else:
+        print("✓ Using FP32 training")
+
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=args.num_epochs,
@@ -239,7 +260,9 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        fp16=args.use_fp16,
+        bf16=use_bf16,  # Prefer BF16 over FP16
+        fp16=use_fp16,  # Use FP16 only if BF16 not available
+        gradient_checkpointing=True,  # Enable to save memory
         remove_unused_columns=False,
         dataloader_drop_last=False,
         report_to="none"
