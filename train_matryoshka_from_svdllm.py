@@ -154,10 +154,48 @@ def load_svdllm_model(
     if not os.path.exists(svd_model_path):
         raise ValueError(f"SVD model path does not exist: {svd_model_path}")
 
-    # Add SVD-LLM to path for custom layer definitions
+    # Add SVD-LLM to path for custom layer definitions (BEFORE torch.load!)
     import sys
-    svdllm_path = '/home/user/SVD-LLM'
-    if os.path.exists(svdllm_path) and svdllm_path not in sys.path:
+
+    # Try to detect SVD-LLM path from model path
+    # e.g., /data1/user/SVD-LLM/svd_llm_output/model.pt -> /data1/user/SVD-LLM
+    potential_paths = []
+
+    # Method 1: Extract from model path
+    model_dir = os.path.dirname(svd_model_path)
+    if 'SVD-LLM' in model_dir:
+        svdllm_candidate = model_dir.split('SVD-LLM')[0] + 'SVD-LLM'
+        potential_paths.append(svdllm_candidate)
+
+    # Method 2: Check parent directories
+    parent = os.path.dirname(model_dir)
+    potential_paths.append(parent)
+    potential_paths.append(os.path.join(parent, 'SVD-LLM'))
+
+    # Method 3: Common locations
+    potential_paths.extend([
+        '/home/user/SVD-LLM',
+        '/root/SVD-LLM',
+        os.path.expanduser('~/SVD-LLM')
+    ])
+
+    svdllm_path = None
+    for path in potential_paths:
+        if os.path.exists(path) and os.path.exists(os.path.join(path, 'component')):
+            svdllm_path = path
+            break
+
+    if svdllm_path is None:
+        raise ValueError(
+            f"Could not find SVD-LLM installation.\n"
+            f"Searched in: {potential_paths}\n"
+            f"Please ensure SVD-LLM is installed and the 'component' directory exists.\n"
+            f"You can clone it from: https://github.com/AIoT-MLSys-Lab/SVD-LLM"
+        )
+
+    print(f"  → Found SVD-LLM at: {svdllm_path}")
+
+    if svdllm_path not in sys.path:
         sys.path.insert(0, svdllm_path)
 
     # Load the .pt file saved by SVD-LLM
@@ -206,15 +244,11 @@ def convert_to_matryoshka(
     Returns:
         Model with MatryoshkaSVDLayers
     """
-    import sys
-    svdllm_path = '/home/user/SVD-LLM'
-    if os.path.exists(svdllm_path) and svdllm_path not in sys.path:
-        sys.path.insert(0, svdllm_path)
-
+    # SVD-LLM path should already be in sys.path from load_svdllm_model()
     try:
         from component.svd_llama import SVD_LlamaAttention, SVD_LlamaMLP
-    except ImportError:
-        print("Warning: Could not import SVD_LlamaAttention/SVD_LlamaMLP")
+    except ImportError as e:
+        print(f"Warning: Could not import SVD_LlamaAttention/SVD_LlamaMLP: {e}")
         print("Skipping Matryoshka conversion")
         return model
 
@@ -349,10 +383,7 @@ def matryoshka_attention_forward(attn, hidden_states, attention_mask=None, posit
     kv_seq_len = key_states.shape[-2]
     cos, sin = attn.rotary_emb(value_states, seq_len=kv_seq_len)
 
-    # Import apply_rotary_pos_emb
-    import sys
-    if '/home/user/SVD-LLM' not in sys.path:
-        sys.path.insert(0, '/home/user/SVD-LLM')
+    # Import apply_rotary_pos_emb (path should already be in sys.path)
     from component.svd_llama import apply_rotary_pos_emb
 
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
