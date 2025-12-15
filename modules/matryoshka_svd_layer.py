@@ -209,8 +209,8 @@ class MatryoshkaSVDLayer(nn.Module):
         device = x.device
 
         # Step 1: Predict rank (if using rank predictor)
-        if self.use_rank_predictor and self.training and self.fixed_rank is None:
-            # Dynamic rank per token
+        if self.use_rank_predictor and self.fixed_rank is None:
+            # Dynamic rank per token (works in both training and inference!)
             rank = self.rank_predictor(x)  # [batch, seq_len, 1]
         elif self.fixed_rank is not None:
             # Fixed rank (for multi-scale training)
@@ -221,7 +221,7 @@ class MatryoshkaSVDLayer(nn.Module):
                 dtype=x.dtype
             )
         else:
-            # Use maximum rank (inference without predictor)
+            # Use maximum rank (fallback when no predictor)
             rank = torch.full(
                 (batch_size, seq_len, 1),
                 self.r_max,
@@ -243,6 +243,13 @@ class MatryoshkaSVDLayer(nn.Module):
         if self.bias is not None:
             output = output + self.bias
 
+        # Cache average predicted rank for monitoring (used in get_effective_rank)
+        if self.use_rank_predictor and self.fixed_rank is None:
+            with torch.no_grad():
+                self._last_avg_rank = rank.mean().item()
+        else:
+            self._last_avg_rank = None
+
         if return_rank:
             return output, rank
         return output
@@ -256,10 +263,13 @@ class MatryoshkaSVDLayer(nn.Module):
         Get the effective rank being used.
 
         Useful for monitoring compression during training.
+        Returns the actual average predicted rank if available.
         """
         if self.fixed_rank is not None:
             return self.fixed_rank
-        return self.r_max
+        if hasattr(self, '_last_avg_rank') and self._last_avg_rank is not None:
+            return self._last_avg_rank  # Return actual predicted average rank
+        return self.r_max  # Fallback
 
     @classmethod
     def from_svdllm_weights(
