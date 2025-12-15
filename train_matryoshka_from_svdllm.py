@@ -145,20 +145,59 @@ def load_svdllm_model(
     """
     print(f"Loading SVD-LLM model from {svd_model_path}...")
 
-    # Load the SVD-compressed model
-    # Note: SVD-LLM uses custom model classes, so we need to handle this carefully
-    try:
-        # Try loading as SVD-LLM format
-        import sys
-        sys.path.insert(0, '/home/user/SVD-LLM')
-        from component.svd_llama import SVD_LlamaForCausalLM
+    # Convert to absolute path if relative
+    svd_model_path = os.path.abspath(svd_model_path)
 
-        model = SVD_LlamaForCausalLM.from_pretrained(svd_model_path)
+    # Check if path exists
+    if not os.path.exists(svd_model_path):
+        raise ValueError(f"SVD model path does not exist: {svd_model_path}")
+
+    model = None
+
+    # Try loading as SVD-LLM format first
+    try:
+        import sys
+        svdllm_path = '/home/user/SVD-LLM'
+        if os.path.exists(svdllm_path) and svdllm_path not in sys.path:
+            sys.path.insert(0, svdllm_path)
+
+        from component.svd_llama import SVD_LlamaForCausalLM
+        print("  → Loading as SVD-LLM format...")
+        model = SVD_LlamaForCausalLM.from_pretrained(
+            svd_model_path,
+            trust_remote_code=True,
+            local_files_only=True
+        )
+        print("  ✓ Successfully loaded SVD-LLM model")
+
+    except ImportError as e:
+        print(f"  ✗ SVD-LLM components not available: {e}")
+        print("  → Attempting to load as standard HuggingFace model...")
 
     except Exception as e:
-        print(f"Error loading SVD-LLM model: {e}")
-        print("Attempting to load as standard model...")
-        model = AutoModelForCausalLM.from_pretrained(svd_model_path)
+        print(f"  ✗ Error loading as SVD-LLM format: {e}")
+        print("  → Attempting to load as standard HuggingFace model...")
+
+    # Fallback to standard loading
+    if model is None:
+        try:
+            print(f"  → Loading from local path: {svd_model_path}")
+            model = AutoModelForCausalLM.from_pretrained(
+                svd_model_path,
+                trust_remote_code=True,
+                local_files_only=True
+            )
+            print("  ✓ Successfully loaded as standard model")
+        except Exception as e:
+            print(f"  ✗ Failed to load model: {e}")
+            raise ValueError(
+                f"Could not load model from {svd_model_path}. "
+                f"Please ensure:\n"
+                f"  1. Path exists and contains model files\n"
+                f"  2. SVD-LLM is installed if using SVD-LLM format\n"
+                f"  3. Model is in HuggingFace format\n"
+                f"Error: {e}"
+            )
 
     # Convert SVD layers to Matryoshka layers
     print("Converting to Matryoshka layers...")
@@ -328,6 +367,7 @@ def main():
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--num_train_epochs', type=int, default=1)
     parser.add_argument('--per_device_train_batch_size', type=int, default=4)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
     parser.add_argument('--logging_steps', type=int, default=10)
@@ -374,6 +414,7 @@ def main():
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         logging_steps=args.logging_steps,
