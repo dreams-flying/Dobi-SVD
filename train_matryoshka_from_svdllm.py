@@ -225,6 +225,55 @@ def load_svdllm_model(
     return model.to(device), tokenizer
 
 
+def create_matryoshka_layer_from_svd(
+    u_proj: nn.Linear,
+    v_proj: nn.Linear,
+    r_max: int,
+    r_min: int,
+    gating_tau: float = 0.1
+) -> MatryoshkaSVDLayer:
+    """
+    Create MatryoshkaSVDLayer and copy weights from existing SVD projections.
+
+    Args:
+        u_proj: Existing U projection from SVD-LLM
+        v_proj: Existing V projection from SVD-LLM
+        r_max: Maximum rank for Matryoshka
+        r_min: Minimum rank
+        gating_tau: Temperature for soft gating
+
+    Returns:
+        MatryoshkaSVDLayer with copied weights
+    """
+    # Get dimensions from existing projections
+    in_features = v_proj.in_features
+    out_features = u_proj.out_features
+    current_rank = v_proj.out_features
+
+    # Effective r_max cannot exceed current rank
+    effective_r_max = min(r_max, current_rank)
+
+    # Create Matryoshka layer
+    matryoshka = MatryoshkaSVDLayer(
+        in_features=in_features,
+        out_features=out_features,
+        r_max=effective_r_max,
+        r_min=r_min,
+        use_rank_predictor=True,
+        gating_tau=gating_tau,
+        bias=False
+    )
+
+    # Copy weights from SVD-LLM projections
+    # V projection: [in_features, r_max]
+    matryoshka.v_proj.weight.data = v_proj.weight.data[:effective_r_max, :].clone()
+
+    # U projection: [out_features, r_max]
+    matryoshka.u_proj.weight.data = u_proj.weight.data[:, :effective_r_max].clone()
+
+    return matryoshka
+
+
 def convert_to_matryoshka(
     model: nn.Module,
     r_max: int,
@@ -265,47 +314,19 @@ def convert_to_matryoshka(
         # Convert attention
         if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, SVD_LlamaAttention):
             attn = layer.self_attn
-            hidden_dim = attn.hidden_size
 
-            # Get current rank from existing projections
-            current_rank = attn.q_v_proj.out_features
-            effective_r_max = min(r_max, current_rank)
-
-            # Wrap each Q/K/V/O projection pair in MatryoshkaSVDLayer
-            attn.q_matryoshka = MatryoshkaSVDLayer(
-                u_proj=attn.q_u_proj,
-                v_proj=attn.q_v_proj,
-                r_max=effective_r_max,
-                r_min=r_min,
-                use_rank_predictor=True,
-                gating_tau=0.1
+            # Create Matryoshka layers from SVD projections
+            attn.q_matryoshka = create_matryoshka_layer_from_svd(
+                attn.q_u_proj, attn.q_v_proj, r_max, r_min
             )
-
-            attn.k_matryoshka = MatryoshkaSVDLayer(
-                u_proj=attn.k_u_proj,
-                v_proj=attn.k_v_proj,
-                r_max=effective_r_max,
-                r_min=r_min,
-                use_rank_predictor=True,
-                gating_tau=0.1
+            attn.k_matryoshka = create_matryoshka_layer_from_svd(
+                attn.k_u_proj, attn.k_v_proj, r_max, r_min
             )
-
-            attn.v_matryoshka = MatryoshkaSVDLayer(
-                u_proj=attn.v_u_proj,
-                v_proj=attn.v_v_proj,
-                r_max=effective_r_max,
-                r_min=r_min,
-                use_rank_predictor=True,
-                gating_tau=0.1
+            attn.v_matryoshka = create_matryoshka_layer_from_svd(
+                attn.v_u_proj, attn.v_v_proj, r_max, r_min
             )
-
-            attn.o_matryoshka = MatryoshkaSVDLayer(
-                u_proj=attn.o_u_proj,
-                v_proj=attn.o_v_proj,
-                r_max=effective_r_max,
-                r_min=r_min,
-                use_rank_predictor=True,
-                gating_tau=0.1
+            attn.o_matryoshka = create_matryoshka_layer_from_svd(
+                attn.o_u_proj, attn.o_v_proj, r_max, r_min
             )
 
             # Replace forward method
@@ -317,38 +338,16 @@ def convert_to_matryoshka(
         # Convert MLP
         if hasattr(layer, 'mlp') and isinstance(layer.mlp, SVD_LlamaMLP):
             mlp = layer.mlp
-            hidden_dim = mlp.gate_v_proj.in_features
 
-            # Get current rank from existing projections
-            current_rank = mlp.gate_v_proj.out_features
-            effective_r_max = min(r_max, current_rank)
-
-            # Wrap each gate/up/down projection pair in MatryoshkaSVDLayer
-            mlp.gate_matryoshka = MatryoshkaSVDLayer(
-                u_proj=mlp.gate_u_proj,
-                v_proj=mlp.gate_v_proj,
-                r_max=effective_r_max,
-                r_min=r_min,
-                use_rank_predictor=True,
-                gating_tau=0.1
+            # Create Matryoshka layers from SVD projections
+            mlp.gate_matryoshka = create_matryoshka_layer_from_svd(
+                mlp.gate_u_proj, mlp.gate_v_proj, r_max, r_min
             )
-
-            mlp.up_matryoshka = MatryoshkaSVDLayer(
-                u_proj=mlp.up_u_proj,
-                v_proj=mlp.up_v_proj,
-                r_max=effective_r_max,
-                r_min=r_min,
-                use_rank_predictor=True,
-                gating_tau=0.1
+            mlp.up_matryoshka = create_matryoshka_layer_from_svd(
+                mlp.up_u_proj, mlp.up_v_proj, r_max, r_min
             )
-
-            mlp.down_matryoshka = MatryoshkaSVDLayer(
-                u_proj=mlp.down_u_proj,
-                v_proj=mlp.down_v_proj,
-                r_max=effective_r_max,
-                r_min=r_min,
-                use_rank_predictor=True,
-                gating_tau=0.1
+            mlp.down_matryoshka = create_matryoshka_layer_from_svd(
+                mlp.down_u_proj, mlp.down_v_proj, r_max, r_min
             )
 
             # Replace forward method
