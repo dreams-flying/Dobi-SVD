@@ -22,13 +22,14 @@ from transformers import (
     Trainer,
     DataCollatorForLanguageModeling
 )
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 import random
 import os
 from typing import Dict, List, Optional
 from pathlib import Path
 
 from modules.matryoshka_svd_layer import MatryoshkaSVDLayer, RankPredictor
+from utils.datautils import prepare_train_loaders
 
 
 class MatryoshkaTrainer(Trainer):
@@ -425,34 +426,6 @@ def matryoshka_mlp_forward(mlp, x):
     return output
 
 
-def prepare_dataset(dataset_name: str, tokenizer, max_length: int = 512):
-    """Prepare training dataset."""
-    if dataset_name == 'wikitext2':
-        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1')
-        column = 'text'
-    elif dataset_name == 'c4':
-        dataset = load_dataset('allenai/c4', 'en', streaming=True)
-        column = 'text'
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-    def tokenize_function(examples):
-        return tokenizer(
-            examples[column],
-            truncation=True,
-            max_length=max_length,
-            padding='max_length'
-        )
-
-    tokenized = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset['train'].column_names
-    )
-
-    return tokenized
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Train Matryoshka SVD on top of SVD-LLM'
@@ -493,8 +466,27 @@ def main():
         help='Freeze U and V, only train rank predictor'
     )
 
+    # Dataset arguments
+    parser.add_argument('--dataset', type=str, default='wikitext2',
+                       help='Dataset name: wikitext2, c4, ptb')
+    parser.add_argument('--seq_len', type=int, default=2048,
+                       help='Sequence length for training')
+    parser.add_argument('--n_train_samples', type=int, default=256,
+                       help='Number of training samples')
+    parser.add_argument('--n_eval_samples', type=int, default=128,
+                       help='Number of evaluation samples')
+    parser.add_argument('--data_cache_dir', type=str, default='./data_cache',
+                       help='Directory for cached tokenized data')
+    parser.add_argument('--dataset_cache_dir', type=str, default='./dataset_cache',
+                       help='Directory for cached raw datasets')
+    parser.add_argument('--SAVE', action='store_true',
+                       help='Save processed datasets to cache')
+    parser.add_argument('--RECREATE', action='store_true',
+                       help='Recreate datasets even if cache exists')
+    parser.add_argument('--seed', type=int, default=0,
+                       help='Random seed for dataset sampling')
+
     # Training arguments
-    parser.add_argument('--dataset', type=str, default='wikitext2')
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--num_train_epochs', type=int, default=1)
     parser.add_argument('--per_device_train_batch_size', type=int, default=4)
@@ -537,7 +529,27 @@ def main():
     print("Step 2: Preparing dataset")
     print("=" * 80)
 
-    dataset = prepare_dataset(args.dataset, tokenizer)
+    # Create cache directories
+    data_cache_dir = Path(args.data_cache_dir)
+    dataset_cache_dir = Path(args.dataset_cache_dir)
+    data_cache_dir.mkdir(parents=True, exist_ok=True)
+    dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load datasets using prepare_train_loaders
+    tokenized_traindata, tokenized_valdata = prepare_train_loaders(
+        tokenizer=tokenizer,
+        DATASET_NAME=args.dataset,
+        data_cache_dir=data_cache_dir,
+        dataset_cache_dir=dataset_cache_dir,
+        args=args
+    )
+
+    # Convert to HuggingFace Dataset format
+    train_dataset = Dataset.from_list(tokenized_traindata)
+    eval_dataset = Dataset.from_list(tokenized_valdata)
+
+    print(f"  ✓ Train samples: {len(train_dataset)}")
+    print(f"  ✓ Eval samples: {len(eval_dataset)}")
 
     # Training arguments
     training_args = TrainingArguments(
@@ -556,7 +568,7 @@ def main():
         metric_for_best_model='eval_loss',
         greater_is_better=False,
         fp16=torch.cuda.is_available(),
-        gradient_checkpointing=False,  # Usually not needed for inference-only compression
+        gradient_checkpointing=False,
         dataloader_num_workers=4,
         remove_unused_columns=False
     )
@@ -581,8 +593,8 @@ def main():
     trainer = MatryoshkaTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset['train'],
-        eval_dataset=dataset.get('validation', dataset.get('test')),
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         r_max=args.r_max,
         r_min=args.r_min,
