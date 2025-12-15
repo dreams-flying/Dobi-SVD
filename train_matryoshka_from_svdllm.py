@@ -361,11 +361,15 @@ def convert_to_matryoshka(
     return model
 
 
-def matryoshka_attention_forward(attn, hidden_states, attention_mask=None, position_ids=None, **kwargs):
+def matryoshka_attention_forward(attn, hidden_states, attention_mask=None, position_ids=None,
+                                 past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
     """
     Matryoshka forward for attention module.
 
     Uses MatryoshkaSVDLayers for Q/K/V/O projections.
+
+    Returns:
+        Tuple of (attn_output, attn_weights, past_key_value)
     """
     bsz, q_len, _ = hidden_states.size()
 
@@ -379,8 +383,12 @@ def matryoshka_attention_forward(attn, hidden_states, attention_mask=None, posit
     key_states = key_states.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
 
-    # Apply rotary embeddings
+    # Handle past_key_value for caching
     kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+
+    # Apply rotary embeddings
     cos, sin = attn.rotary_emb(value_states, seq_len=kv_seq_len)
 
     # Import apply_rotary_pos_emb (path should already be in sys.path)
@@ -388,11 +396,20 @@ def matryoshka_attention_forward(attn, hidden_states, attention_mask=None, posit
 
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+    # Concatenate with past_key_value if provided
+    if past_key_value is not None:
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+    # Update past_key_value for next iteration
+    past_key_value = (key_states, value_states) if use_cache else None
+
     # Attention computation
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (attn.head_dim ** 0.5)
 
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
+        attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device))
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
     attn_output = torch.matmul(attn_weights, value_states)
@@ -404,7 +421,11 @@ def matryoshka_attention_forward(attn, hidden_states, attention_mask=None, posit
     # Use Matryoshka layer for output projection
     attn_output = attn.o_matryoshka(attn_output)
 
-    return (attn_output,)
+    # Return None for attn_weights if not requested
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
 
 
 def matryoshka_mlp_forward(mlp, x):
