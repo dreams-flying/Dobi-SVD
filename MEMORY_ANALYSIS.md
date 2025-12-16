@@ -194,9 +194,12 @@ training_args = TrainingArguments(
 ## 🚀 立即行动
 
 ### 关键修改优先级:
-1. ✅ **立即**: 修复权重重复问题 (节省18GB)
-2. ✅ **立即**: 启用梯度检查点 (节省2GB)
-3. ✅ **推荐**: 使用8-bit optimizer (节省14GB)
+1. ✅ **已完成**: 修复权重重复问题 (节省18GB)
+2. ✅ **已完成**: 启用梯度检查点 (节省2GB)
+   - ⚠️ **重要**: 梯度检查点要求训练时使用固定rank (已实现)
+   - 训练时: 使用固定rank (r_max 或多尺度采样)
+   - 评估时: 启用动态rank预测
+3. ⚠️ **推荐**: 使用8-bit optimizer (节省14GB)
 4. ⚠️ **可选**: 调整batch size (节省3GB)
 
 ### 实施步骤:
@@ -213,3 +216,76 @@ CUDA_VISIBLE_DEVICES=3 python train_matryoshka_from_svdllm.py \
     --freeze_uv \
     --num_train_epochs 1
 ```
+
+---
+
+## 🔧 梯度检查点与动态rank的兼容性问题
+
+### 问题描述
+启用梯度检查点后出现错误:
+```
+torch.utils.checkpoint.CheckpointError: Recomputed values have different metadata
+tensor at position 7:
+  saved: {'shape': torch.Size([4096, 256]), ...}
+  recomputed: {'shape': torch.Size([4096, 4096]), ...}
+```
+
+### 根本原因
+- **梯度检查点**: 要求前向传播是确定性的 (相同输入→相同中间张量形状)
+- **动态rank预测**: RankPredictor每次调用产生不同输出 → 前向和重计算时形状不同
+- **冲突**: 梯度检查点重计算激活值时，RankPredictor预测了不同的rank，导致张量形状不匹配
+
+### 解决方案 ✅
+
+**训练时使用固定rank，评估时启用动态预测**
+
+修改 `MatryoshkaTrainer.compute_loss()`:
+```python
+def compute_loss(self, model, inputs, return_outputs=False):
+    use_multiscale = random.random() < self.multiscale_frequency
+
+    if use_multiscale and self.model.training:
+        # 多尺度训练: 采样多个固定rank
+        sampled_ranks = [self.r_min, self.r_max, random.randint(self.r_min+1, self.r_max-1)]
+        for rank in sampled_ranks:
+            set_model_rank(model, rank)  # 固定rank
+            outputs = model(**inputs)
+            # ...
+    else:
+        # 常规训练: 使用r_max作为固定rank (不是动态!)
+        set_model_rank(model, self.r_max)  # 固定rank, 确保梯度检查点兼容
+        outputs = model(**inputs)
+        # ...
+```
+
+添加 `evaluation_loop()` 方法:
+```python
+def evaluation_loop(self, *args, **kwargs):
+    # 评估时启用动态rank预测 (不使用梯度检查点)
+    set_model_rank(self.model, None)  # None = 动态预测
+    result = super().evaluation_loop(*args, **kwargs)
+    # 恢复固定rank
+    set_model_rank(self.model, self.r_max)
+    return result
+```
+
+### 工作原理
+1. **训练阶段** (model.training=True):
+   - 始终使用固定rank (r_max 或多尺度采样的rank)
+   - 前向传播确定性 → 梯度检查点正常工作 ✅
+   - 仍然通过多尺度训练学习嵌套结构
+
+2. **评估阶段** (model.eval()):
+   - 启用动态rank预测 (设置fixed_rank=None)
+   - 无梯度检查点 → 无形状冲突
+   - 获得模型真实的动态压缩行为
+
+3. **推理阶段**:
+   - 默认启用动态rank预测
+   - 每个token自适应选择最优rank
+
+### 优势
+- ✅ 保留梯度检查点优化 (~2GB内存节省)
+- ✅ 保留多尺度训练 (学习嵌套结构)
+- ✅ 评估时准确测量动态压缩性能
+- ✅ 训练稳定性高 (确定性前向传播)

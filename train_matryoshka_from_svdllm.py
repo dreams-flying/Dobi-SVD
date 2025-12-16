@@ -55,6 +55,10 @@ class MatryoshkaTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         Compute loss with multi-scale training and rank regularization.
+
+        IMPORTANT: Always uses FIXED ranks during training to ensure gradient
+        checkpointing compatibility. Dynamic rank prediction is only enabled
+        during evaluation/inference.
         """
         # Multi-scale training
         use_multiscale = random.random() < self.multiscale_frequency
@@ -77,23 +81,41 @@ class MatryoshkaTrainer(Trainer):
                 loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
                 total_loss += loss
 
-                # Clear fixed rank
-                set_model_rank(model, None)
-
             main_loss = total_loss / len(sampled_ranks)
             outputs = None  # We don't return outputs in multiscale mode
 
         else:
-            # Regular forward (dynamic rank prediction)
-            set_model_rank(model, None)
+            # Regular forward: use r_max as fixed rank (not dynamic!)
+            # This ensures gradient checkpointing works correctly
+            set_model_rank(model, self.r_max)
             outputs = model(**inputs)
             main_loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
 
         # Add rank regularization (encourage lower average rank)
+        # NOTE: During fixed-rank training, this will be zero since
+        # get_effective_rank() returns the fixed rank, not predicted rank
         rank_reg = compute_rank_regularization(model)
         total_loss = main_loss + self.lambda_rank * rank_reg
 
         return (total_loss, outputs) if return_outputs else total_loss
+
+    def evaluation_loop(self, *args, **kwargs):
+        """
+        Override evaluation to enable dynamic rank prediction.
+
+        During evaluation, we don't use gradient checkpointing, so dynamic
+        rank prediction is safe and gives us better estimates of model behavior.
+        """
+        # Enable dynamic rank prediction for evaluation
+        set_model_rank(self.model, None)
+
+        # Run standard evaluation
+        result = super().evaluation_loop(*args, **kwargs)
+
+        # Reset to fixed rank after evaluation (in case training continues)
+        set_model_rank(self.model, self.r_max)
+
+        return result
 
 
 def set_model_rank(model: nn.Module, rank: Optional[float]):
