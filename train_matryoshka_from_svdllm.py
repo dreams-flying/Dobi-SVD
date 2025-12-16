@@ -697,16 +697,28 @@ def main():
 
     # Save final model
     print("\nSaving final model...")
-    trainer.save_model(os.path.join(args.output_dir, 'final'))
+    final_output_dir = os.path.join(args.output_dir, 'final')
+    trainer.save_model(final_output_dir)
+
+    # Save tokenizer explicitly (IMPORTANT: needed for evaluation)
+    print("Saving tokenizer...")
+    tokenizer.save_pretrained(final_output_dir)
 
     print("\n" + "=" * 80)
     print("Training completed!")
     print("=" * 80)
-    print(f"Model saved to: {args.output_dir}/final")
-    print("\nTo evaluate at different ranks:")
-    print(f"  python evaluate_matryoshka.py \\")
-    print(f"    --checkpoint {args.output_dir}/final \\")
-    print(f"    --target_rank 64")
+    print(f"Model saved to: {final_output_dir}")
+    print(f"Tokenizer saved to: {final_output_dir}")
+    print("\nTo evaluate:")
+    print(f"  # Adaptive rank (dynamic prediction)")
+    print(f"  python evaluate_matryoshka_svdllm.py \\")
+    print(f"    --checkpoint {final_output_dir} \\")
+    print(f"    --eval_rank adaptive")
+    print(f"")
+    print(f"  # Multi-rank evaluation")
+    print(f"  python evaluate_matryoshka_svdllm.py \\")
+    print(f"    --checkpoint {final_output_dir} \\")
+    print(f"    --multi_rank_eval")
 
 
 if __name__ == '__main__':

@@ -52,6 +52,7 @@ from utils.datautils import prepare_train_loaders
 
 def load_matryoshka_model(
     checkpoint_path: str,
+    base_model: Optional[str] = None,
     device: str = 'cuda'
 ) -> Tuple[nn.Module, AutoTokenizer, Optional[Dict]]:
     """
@@ -59,6 +60,7 @@ def load_matryoshka_model(
 
     Args:
         checkpoint_path: Path to checkpoint directory (HuggingFace format)
+        base_model: Base model name for tokenizer (if not in checkpoint)
         device: Device to load model on
 
     Returns:
@@ -73,9 +75,31 @@ def load_matryoshka_model(
 
     checkpoint_path = Path(checkpoint_path)
 
-    # Load tokenizer
+    # Load tokenizer - try checkpoint first, then base_model
     print(f"\nLoading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        print(f"  Loaded from checkpoint")
+    except Exception as e:
+        if base_model is None:
+            # Try to infer base model from config
+            config_path = checkpoint_path / 'config.json'
+            if config_path.exists():
+                import json
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    base_model = config.get('_name_or_path', None)
+                    print(f"  Inferred base model from config: {base_model}")
+
+        if base_model is None:
+            raise ValueError(
+                f"Cannot load tokenizer from checkpoint and no base_model provided.\n"
+                f"Please provide --base_model argument (e.g., meta-llama/Llama-2-7b-hf)"
+            )
+
+        print(f"  Loading from base model: {base_model}")
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -418,6 +442,7 @@ def main(args):
     # Load model
     model, tokenizer, config = load_matryoshka_model(
         args.checkpoint,
+        base_model=args.base_model,
         device=device
     )
 
@@ -534,6 +559,13 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help='Path to model checkpoint (HuggingFace format directory)'
+    )
+    parser.add_argument(
+        '--base_model',
+        type=str,
+        default=None,
+        help='Base model name for tokenizer (e.g., meta-llama/Llama-2-7b-hf). '
+             'Only needed if tokenizer not saved in checkpoint.'
     )
 
     # Evaluation arguments
