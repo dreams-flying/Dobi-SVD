@@ -695,14 +695,20 @@ def main():
     # Train
     trainer.train()
 
-    # Save final model
+    # Save final model using custom save function to preserve MatryoshkaSVDLayer
     print("\nSaving final model...")
     final_output_dir = os.path.join(args.output_dir, 'final')
-    trainer.save_model(final_output_dir)
 
-    # Save tokenizer explicitly (IMPORTANT: needed for evaluation)
-    print("Saving tokenizer...")
-    tokenizer.save_pretrained(final_output_dir)
+    # Import custom save function
+    from matryoshka_model_utils import save_matryoshka_model
+
+    # Use custom save to preserve Matryoshka structure
+    save_matryoshka_model(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        output_dir=final_output_dir,
+        safe_serialization=True
+    )
 
     print("\n" + "=" * 80)
     print("Training completed!")

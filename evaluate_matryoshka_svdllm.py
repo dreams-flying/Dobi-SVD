@@ -56,77 +56,32 @@ def load_matryoshka_model(
     device: str = 'cuda'
 ) -> Tuple[nn.Module, AutoTokenizer, Optional[Dict]]:
     """
-    Load Matryoshka SVD model from HuggingFace checkpoint.
+    Load Matryoshka SVD model from checkpoint.
+
+    This function uses the custom matryoshka_model_utils.load_matryoshka_model()
+    which properly reconstructs MatryoshkaSVDLayer instances from saved metadata.
 
     Args:
-        checkpoint_path: Path to checkpoint directory (HuggingFace format)
+        checkpoint_path: Path to checkpoint directory
         base_model: Base model name for tokenizer (if not in checkpoint)
         device: Device to load model on
 
     Returns:
-        model: Loaded model
+        model: Loaded model with MatryoshkaSVDLayer reconstructed
         tokenizer: Tokenizer
         config: Model configuration
     """
-    print(f"\n{'='*80}")
-    print(f"Loading Matryoshka SVD Model")
-    print(f"{'='*80}")
-    print(f"Checkpoint: {checkpoint_path}")
+    from matryoshka_model_utils import load_matryoshka_model as load_matryoshka_custom
 
-    checkpoint_path = Path(checkpoint_path)
+    # Use custom load function that reconstructs MatryoshkaSVDLayer
+    model, tokenizer = load_matryoshka_custom(
+        checkpoint_path=checkpoint_path,
+        base_model=base_model,
+        device=device,
+        torch_dtype=torch.float32
+    )
 
-    # Load tokenizer - try checkpoint first, then base_model
-    print(f"\nLoading tokenizer...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-        print(f"  Loaded from checkpoint")
-    except Exception as e:
-        if base_model is None:
-            # Try to infer base model from config
-            config_path = checkpoint_path / 'config.json'
-            if config_path.exists():
-                import json
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-                    base_model = config.get('_name_or_path', None)
-                    print(f"  Inferred base model from config: {base_model}")
-
-        if base_model is None:
-            raise ValueError(
-                f"Cannot load tokenizer from checkpoint and no base_model provided.\n"
-                f"Please provide --base_model argument (e.g., meta-llama/Llama-2-7b-hf)"
-            )
-
-        print(f"  Loading from base model: {base_model}")
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Load model
-    print(f"Loading model...")
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            checkpoint_path,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
-            device_map=None  # We'll move to device manually
-        )
-    except Exception as e:
-        print(f"Error loading with AutoModel: {e}")
-        print(f"Trying LlamaForCausalLM...")
-        model = LlamaForCausalLM.from_pretrained(
-            checkpoint_path,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
-            device_map=None
-        )
-
-    # Move to device
-    model.to(device)
-    model.eval()
-
-    # Extract Matryoshka layer info
+    # Extract Matryoshka layer info for config
     matryoshka_layers = []
     for name, module in model.named_modules():
         if isinstance(module, MatryoshkaSVDLayer):
@@ -137,23 +92,6 @@ def load_matryoshka_model(
                 'predictor_mode': module.predictor_mode,
                 'hard_inference': module.hard_inference
             })
-
-    if not matryoshka_layers:
-        print(f"\n⚠️  WARNING: No MatryoshkaSVDLayer found in model!")
-        print(f"This might not be a Matryoshka SVD model.")
-
-    print(f"\n{'='*80}")
-    print(f"Model Loaded Successfully")
-    print(f"{'='*80}")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Matryoshka layers found: {len(matryoshka_layers)}")
-
-    if matryoshka_layers:
-        example = matryoshka_layers[0]
-        print(f"\nMatryoshka Configuration:")
-        print(f"  Rank range: [{example['r_min']}, {example['r_max']}]")
-        print(f"  Predictor mode: {example['predictor_mode']}")
-        print(f"  Hard inference: {example['hard_inference']}")
 
     config = {
         'num_matryoshka_layers': len(matryoshka_layers),
