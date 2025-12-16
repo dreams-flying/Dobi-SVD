@@ -234,7 +234,9 @@ def create_matryoshka_layer_from_svd(
     gating_tau: float = 0.1
 ) -> MatryoshkaSVDLayer:
     """
-    Create MatryoshkaSVDLayer and copy weights from existing SVD projections.
+    Create MatryoshkaSVDLayer and reuse weights from existing SVD projections.
+
+    MEMORY OPTIMIZATION: Uses weight views instead of cloning to save memory.
 
     Args:
         u_proj: Existing U projection from SVD-LLM
@@ -244,7 +246,7 @@ def create_matryoshka_layer_from_svd(
         gating_tau: Temperature for soft gating
 
     Returns:
-        MatryoshkaSVDLayer with copied weights
+        MatryoshkaSVDLayer with reused weights (zero-copy)
     """
     # Get dimensions from existing projections
     in_features = v_proj.in_features
@@ -265,12 +267,20 @@ def create_matryoshka_layer_from_svd(
         bias=False
     )
 
-    # Copy weights from SVD-LLM projections
-    # V projection: [in_features, r_max]
-    matryoshka.v_proj.weight.data = v_proj.weight.data[:effective_r_max, :].clone()
+    # MEMORY OPTIMIZATION: Reuse weights instead of cloning
+    # V projection: [r_max, in_features] (transposed)
+    # Use contiguous() to ensure memory layout is correct
+    v_weight_slice = v_proj.weight.data[:effective_r_max, :].contiguous()
+    matryoshka.v_proj.weight = nn.Parameter(v_weight_slice, requires_grad=True)
 
     # U projection: [out_features, r_max]
-    matryoshka.u_proj.weight.data = u_proj.weight.data[:, :effective_r_max].clone()
+    u_weight_slice = u_proj.weight.data[:, :effective_r_max].contiguous()
+    matryoshka.u_proj.weight = nn.Parameter(u_weight_slice, requires_grad=True)
+
+    # Mark original projections for deletion
+    # They will be deleted in convert_to_matryoshka()
+    u_proj._to_delete = True
+    v_proj._to_delete = True
 
     return matryoshka
 
@@ -330,6 +340,16 @@ def convert_to_matryoshka(
                 attn.o_u_proj, attn.o_v_proj, r_max, r_min
             )
 
+            # MEMORY OPTIMIZATION: Delete original projections to free memory
+            del attn.q_u_proj, attn.q_v_proj
+            del attn.k_u_proj, attn.k_v_proj
+            del attn.v_u_proj, attn.v_v_proj
+            del attn.o_u_proj, attn.o_v_proj
+            attn.q_u_proj = attn.q_v_proj = None
+            attn.k_u_proj = attn.k_v_proj = None
+            attn.v_u_proj = attn.v_v_proj = None
+            attn.o_u_proj = attn.o_v_proj = None
+
             # Replace forward method
             attn.original_forward = attn.forward
             attn.forward = lambda *args, **kwargs: matryoshka_attention_forward(attn, *args, **kwargs)
@@ -351,6 +371,14 @@ def convert_to_matryoshka(
                 mlp.down_u_proj, mlp.down_v_proj, r_max, r_min
             )
 
+            # MEMORY OPTIMIZATION: Delete original projections to free memory
+            del mlp.gate_u_proj, mlp.gate_v_proj
+            del mlp.up_u_proj, mlp.up_v_proj
+            del mlp.down_u_proj, mlp.down_v_proj
+            mlp.gate_u_proj = mlp.gate_v_proj = None
+            mlp.up_u_proj = mlp.up_v_proj = None
+            mlp.down_u_proj = mlp.down_v_proj = None
+
             # Replace forward method
             mlp.original_forward = mlp.forward
             mlp.forward = lambda x: matryoshka_mlp_forward(mlp, x)
@@ -358,6 +386,14 @@ def convert_to_matryoshka(
             conversion_count += 3  # 3 projections
 
     print(f"  ✓ Converted {conversion_count} projections to Matryoshka layers")
+
+    # MEMORY OPTIMIZATION: Force garbage collection
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"  ✓ Freed GPU memory after conversion")
+
     return model
 
 
@@ -588,10 +624,21 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model='eval_loss',
         greater_is_better=False,
-        fp16=torch.cuda.is_available(),
-        gradient_checkpointing=False,
-        dataloader_num_workers=4,
-        remove_unused_columns=False
+
+        # MEMORY OPTIMIZATION: Enable gradient checkpointing
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+
+        # Use bf16 for better stability (same memory as fp16)
+        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+
+        # Reduce dataloader workers to save memory
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+
+        # Optional: Use 8-bit Adam optimizer (install bitsandbytes)
+        # optim="adamw_bnb_8bit",  # Uncomment if bitsandbytes is installed
     )
 
     # Data collator
