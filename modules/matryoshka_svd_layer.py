@@ -189,6 +189,7 @@ class MatryoshkaSVDLayer(nn.Module):
         use_gumbel: bool = False,
         gumbel_tau: float = 1.0,
         gumbel_hard: bool = False,
+        hard_inference: bool = True,
         bias: bool = False
     ):
         """
@@ -198,11 +199,14 @@ class MatryoshkaSVDLayer(nn.Module):
             r_max: Maximum rank (size of low-rank bottleneck)
             r_min: Minimum rank
             use_rank_predictor: If True, use dynamic per-token rank/masking
-            predictor_mode: 'rank' (scalar rank) or 'dimension_wise' (per-dim mask)
+            predictor_mode: 'rank' (scalar rank, Matryoshka) or 'dimension_wise' (sparse)
             gating_tau: Temperature for soft gating (smaller = sharper cutoff)
             use_gumbel: Use Gumbel-Softmax for dimension-wise mode (sharper masks)
             gumbel_tau: Temperature for Gumbel-Softmax
             gumbel_hard: Use straight-through estimator (hard but differentiable)
+            hard_inference: If True, use hard thresholding during inference (rank mode only)
+                           Training: soft mask (differentiable)
+                           Inference: hard mask (true speedup via matrix slicing)
             bias: Whether to use bias (typically False for LLMs)
         """
         super().__init__()
@@ -214,6 +218,7 @@ class MatryoshkaSVDLayer(nn.Module):
         self.gating_tau = gating_tau
         self.use_rank_predictor = use_rank_predictor
         self.predictor_mode = predictor_mode
+        self.hard_inference = hard_inference
 
         # V projection: [in_features, r_max] - reduces dimension
         self.v_proj = nn.Linear(in_features, r_max, bias=False)
@@ -258,14 +263,18 @@ class MatryoshkaSVDLayer(nn.Module):
         device: torch.device
     ) -> torch.Tensor:
         """
-        Compute soft gating weights based on predicted rank.
+        Compute gating weights based on predicted rank (Matryoshka nested structure).
 
-        Uses sigmoid function centered at each position k:
+        Uses sigmoid function for smooth rank transitions:
             gate_k = σ((r - k) / τ)
 
         When r = k, gate ≈ 0.5
         When r >> k, gate ≈ 1 (keep this dimension)
         When r << k, gate ≈ 0 (truncate this dimension)
+
+        IMPORTANT FOR MATRYOSHKA:
+        - Training: Soft mask (differentiable, enables backprop through rank)
+        - Inference: Hard mask if hard_inference=True (enables physical matrix slicing)
 
         Args:
             rank: Predicted ranks [batch, seq_len, 1]
@@ -275,6 +284,7 @@ class MatryoshkaSVDLayer(nn.Module):
             Gating weights [batch, seq_len, r_max]
         """
         # Create position indices [1, 2, ..., r_max]
+        # NOTE: Starting from 1 (not 0) follows SVD convention
         positions = torch.arange(
             1, self.r_max + 1,
             device=device,
@@ -287,8 +297,19 @@ class MatryoshkaSVDLayer(nn.Module):
         # -> diff: [batch, seq_len, r_max]
         diff = rank - positions.unsqueeze(0).unsqueeze(0)
 
-        # Apply sigmoid gating
-        gates = torch.sigmoid(diff / self.gating_tau)
+        if self.training:
+            # Training: Soft gating for differentiability
+            gates = torch.sigmoid(diff / self.gating_tau)
+        else:
+            # Inference: Choose between soft and hard gating
+            if self.hard_inference and self.predictor_mode == 'rank':
+                # Hard thresholding: exactly replicate Matryoshka nested structure
+                # gate[k] = 1 if k < rank, else 0
+                # This enables physical matrix slicing for true speedup!
+                gates = (diff > 0).float()
+            else:
+                # Soft gating (default for dimension_wise mode)
+                gates = torch.sigmoid(diff / self.gating_tau)
 
         return gates
 
