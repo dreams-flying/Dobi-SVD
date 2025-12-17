@@ -11,10 +11,11 @@ print("Testing MatryoshkaSVDLayer Forward Pass")
 print("="*80)
 
 # Load model
+print("\nLoading model...")
 model, tokenizer = load_matryoshka_model(
     checkpoint_path="matryoshka_output0/final",
     device='cuda',
-    torch_dtype=torch.float16
+    torch_dtype=torch.float32  # Use float32 for better numerical stability
 )
 
 model.eval()
@@ -24,7 +25,7 @@ batch_size = 1
 seq_len = 4
 hidden_size = 4096
 
-x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=torch.float16)
+x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=torch.float32)
 
 print(f"\nTest input shape: {x.shape}")
 print(f"Test input mean: {x.mean().item():.6f}, std: {x.std().item():.6f}")
