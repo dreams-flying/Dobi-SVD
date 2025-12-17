@@ -206,6 +206,20 @@ def load_matryoshka_model(
 
     print(f"  Total tensors in checkpoint: {len(checkpoint_state)}")
 
+    # Check what types of weights we have
+    matryoshka_keys = [k for k in checkpoint_state.keys() if 'matryoshka' in k]
+    standard_keys = [k for k in checkpoint_state.keys() if any(x in k for x in ['q_proj.weight', 'k_proj.weight', 'v_proj.weight'])]
+
+    if matryoshka_keys:
+        print(f"  Found {len(matryoshka_keys)} matryoshka-related tensors")
+        print(f"    Examples: {matryoshka_keys[:3]}")
+    else:
+        print(f"  ⚠️  WARNING: No matryoshka tensors found in checkpoint!")
+
+    if standard_keys:
+        print(f"  Found {len(standard_keys)} standard Linear tensors")
+        print(f"    Examples: {standard_keys[:3]}")
+
     # 4. Load base model (this will have Linear layers, but we'll replace them)
     print(f"\nLoading base model...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -262,6 +276,14 @@ def load_matryoshka_model(
             missing, unexpected = matryoshka_layer.load_state_dict(layer_state, strict=False)
             if missing:
                 print(f"  ⚠️  {name}: Missing keys: {missing[:3]}...")  # Show first 3
+
+            # Verify weights were loaded (check if they're not random)
+            if layers_reconstructed == 0:  # Only check first layer to avoid spam
+                v_mean = matryoshka_layer.v_proj.weight.data.abs().mean().item()
+                u_mean = matryoshka_layer.u_proj.weight.data.abs().mean().item()
+                print(f"  📊 Weight sanity check - v_proj mean: {v_mean:.6f}, u_proj mean: {u_mean:.6f}")
+                if v_mean < 1e-6 or u_mean < 1e-6:
+                    print(f"  ⚠️  WARNING: Weights are suspiciously small (possibly zeros)!")
         else:
             print(f"  ⚠️  {name}: No weights found in checkpoint!")
 
@@ -269,7 +291,9 @@ def load_matryoshka_model(
         setattr(parent, parts[-1], matryoshka_layer)
         layers_reconstructed += 1
 
-        print(f"  ✅ {name}: Linear → MatryoshkaSVDLayer (r={layer_info['r_min']}-{layer_info['r_max']})")
+        if layers_reconstructed <= 3 or layers_reconstructed == len(matryoshka_layers_info):
+            # Show detailed info for first 3 and last layer
+            print(f"  ✅ {name}: Linear → MatryoshkaSVDLayer (r={layer_info['r_min']}-{layer_info['r_max']})")
 
     print(f"\nReconstructed {layers_reconstructed}/{len(matryoshka_layers_info)} layers")
 
