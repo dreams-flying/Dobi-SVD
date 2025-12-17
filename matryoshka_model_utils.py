@@ -285,6 +285,26 @@ def load_matryoshka_model(
         if script_dir not in sys.path:
             sys.path.insert(0, script_dir)
 
+        # IMPORTANT: Add SVD-LLM to path (needed for component.svd_llama imports in forward functions)
+        svdllm_paths = [
+            '/home/user/SVD-LLM',
+            '/root/SVD-LLM',
+            os.path.expanduser('~/SVD-LLM'),
+            '/data1/lichangqun/SVD-LLM'
+        ]
+        svdllm_found = False
+        for svdllm_path in svdllm_paths:
+            if os.path.exists(svdllm_path) and os.path.exists(os.path.join(svdllm_path, 'component')):
+                if svdllm_path not in sys.path:
+                    sys.path.insert(0, svdllm_path)
+                print(f"  Found SVD-LLM at: {svdllm_path}")
+                svdllm_found = True
+                break
+
+        if not svdllm_found:
+            print(f"  ⚠️  Warning: SVD-LLM not found in common paths")
+            print(f"     Forward methods may fail if they need component.svd_llama")
+
         from train_matryoshka_from_svdllm import (
             matryoshka_attention_forward,
             matryoshka_mlp_forward
@@ -323,6 +343,8 @@ def load_matryoshka_model(
     except Exception as e:
         print(f"  ⚠️  Warning: Could not patch forward methods: {e}")
         print(f"     The model may not work correctly!")
+        import traceback
+        traceback.print_exc()
 
     # 6. Load tokenizer
     print(f"\nLoading tokenizer...")
