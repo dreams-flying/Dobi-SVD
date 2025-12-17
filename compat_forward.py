@@ -94,7 +94,10 @@ def create_compat_attention_forward(attn):
 
         # Softmax and dropout
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=attn.attention_dropout, training=attn.training)
+
+        # Get dropout probability (use 0.0 if not available, which is fine for eval mode)
+        dropout_p = getattr(attn, 'attention_dropout', 0.0)
+        attn_weights = nn.functional.dropout(attn_weights, p=dropout_p, training=attn.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, attn.num_heads, q_len, attn.head_dim):
