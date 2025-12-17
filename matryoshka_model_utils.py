@@ -273,6 +273,57 @@ def load_matryoshka_model(
 
     print(f"\nReconstructed {layers_reconstructed}/{len(matryoshka_layers_info)} layers")
 
+    # CRITICAL: Patch forward methods to use MatryoshkaSVDLayer
+    print(f"\nPatching forward methods to use Matryoshka layers...")
+    forward_patched = 0
+
+    # Import forward functions from training script
+    try:
+        import sys
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+
+        from train_matryoshka_from_svdllm import (
+            matryoshka_attention_forward,
+            matryoshka_mlp_forward
+        )
+
+        # Patch attention and MLP forward methods
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            for layer_idx, layer in enumerate(model.model.layers):
+                # Patch attention forward
+                if hasattr(layer, 'self_attn'):
+                    attn = layer.self_attn
+                    # Check if this attention has matryoshka layers
+                    if (hasattr(attn, 'q_matryoshka') and
+                        hasattr(attn, 'k_matryoshka') and
+                        hasattr(attn, 'v_matryoshka') and
+                        hasattr(attn, 'o_matryoshka')):
+                        # Patch forward method
+                        attn.original_forward = attn.forward
+                        attn.forward = lambda *args, _attn=attn, **kwargs: matryoshka_attention_forward(_attn, *args, **kwargs)
+                        forward_patched += 1
+
+                # Patch MLP forward
+                if hasattr(layer, 'mlp'):
+                    mlp = layer.mlp
+                    # Check if this MLP has matryoshka layers
+                    if (hasattr(mlp, 'gate_matryoshka') and
+                        hasattr(mlp, 'up_matryoshka') and
+                        hasattr(mlp, 'down_matryoshka')):
+                        # Patch forward method
+                        mlp.original_forward = mlp.forward
+                        mlp.forward = lambda x, _mlp=mlp: matryoshka_mlp_forward(_mlp, x)
+                        forward_patched += 1
+
+        print(f"  ✅ Patched {forward_patched} attention/MLP forward methods")
+
+    except Exception as e:
+        print(f"  ⚠️  Warning: Could not patch forward methods: {e}")
+        print(f"     The model may not work correctly!")
+
     # 6. Load tokenizer
     print(f"\nLoading tokenizer...")
     try:
