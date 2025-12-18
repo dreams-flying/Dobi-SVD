@@ -13,12 +13,22 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from improved_rank_predictor import (
-    ImprovedRankPredictor,
-    build_nested_mask,
-    build_nested_mask_gumbel,
-    RankRegularizationLoss
-)
+try:
+    # Try relative import (when used as module)
+    from .improved_rank_predictor import (
+        ImprovedRankPredictor,
+        build_nested_mask,
+        build_nested_mask_gumbel,
+        RankRegularizationLoss
+    )
+except ImportError:
+    # Try absolute import (when run directly)
+    from improved_rank_predictor import (
+        ImprovedRankPredictor,
+        build_nested_mask,
+        build_nested_mask_gumbel,
+        RankRegularizationLoss
+    )
 
 
 class MatryoshkaSVDLayerV2(nn.Module):
@@ -87,6 +97,9 @@ class MatryoshkaSVDLayerV2(nn.Module):
 
         # For fixed rank mode (training with specific rank)
         self.fixed_rank = None
+
+        # Cache last average rank for get_effective_rank() without arguments
+        self._last_avg_rank = None
 
     def set_fixed_rank(self, rank: Optional[int]):
         """
@@ -157,29 +170,41 @@ class MatryoshkaSVDLayerV2(nn.Module):
         # Apply gating: [batch, seq_len, r_max] ⊙ [batch, seq_len, r_max]
         z_gated = z * gates
 
+        # Cache average rank for get_effective_rank() without arguments
+        if self.training and self.use_rank_predictor:
+            self._last_avg_rank = rank.mean().item()
+
         # U projection: [batch, seq_len, r_max] → [batch, seq_len, out_features]
         output = self.u_proj(z_gated)
 
         return output
 
-    def get_effective_rank(self, x: torch.Tensor) -> torch.Tensor:
+    def get_effective_rank(self, x: Optional[torch.Tensor] = None) -> float:
         """
         Get the effective rank being used (for logging/analysis).
 
         Args:
-            x: Input tensor
+            x: Optional input tensor. If provided, computes rank immediately.
+               If None, returns cached rank from last forward pass.
 
         Returns:
-            effective_rank: Average effective rank across tokens
+            effective_rank: Average effective rank (scalar float)
         """
         if self.fixed_rank is not None:
-            return torch.tensor(self.fixed_rank, dtype=torch.float32)
+            return float(self.fixed_rank)
 
-        if self.use_rank_predictor and self.rank_predictor is not None:
-            rank = self.rank_predictor(x)
-            return rank.mean()
+        if x is not None:
+            # Compute rank immediately from input
+            if self.use_rank_predictor and self.rank_predictor is not None:
+                rank = self.rank_predictor(x)
+                return rank.mean().item()
+        else:
+            # Use cached rank from last forward pass
+            if hasattr(self, '_last_avg_rank') and self._last_avg_rank is not None:
+                return self._last_avg_rank
 
-        return torch.tensor(self.r_max, dtype=torch.float32)
+        # Fallback
+        return float(self.r_max)
 
     def get_compression_ratio(self) -> float:
         """
